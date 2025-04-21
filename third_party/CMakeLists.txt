@@ -1,0 +1,85 @@
+# SPDX-FileCopyrightText: © 2024 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+
+set(TT_MLIR_VERSION "1c76dd789db1184c7cb03139789decdc748d7c4d")
+set(LOGURU_VERSION "4adaa185883e3c04da25913579c451d3c32cfac1")
+
+if (TOOLCHAIN STREQUAL "ON")
+    cmake_minimum_required(VERSION 3.20)
+    project(ttmlir-toolchain LANGUAGES CXX C)
+    execute_process(
+        COMMAND git clone --recursive https://github.com/tenstorrent/tt-mlir.git ${PROJECT_SOURCE_DIR}/tt-mlir/src/tt-mlir
+        RESULT_VARIABLE result1
+        OUTPUT_VARIABLE output1
+        ERROR_VARIABLE error_output1
+    )
+    if (NOT ${result1} EQUAL 0)
+        message(FATAL_ERROR "Failed to clone tt-mlir: ${error_output1}")
+    endif()
+    execute_process(
+        COMMAND /bin/bash -c "cd ${PROJECT_SOURCE_DIR}/tt-mlir/src/tt-mlir && git checkout ${TT_MLIR_VERSION}"
+    )
+else()
+    include(ExternalProject)
+    add_subdirectory(pjrt_c_api)
+    set(TTMLIR_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tt-mlir")
+    set(TTMLIR_BUILD_DIR "${TTMLIR_SOURCE_DIR}/build")
+    set(TTMLIR_LIB_DIR ${TTMLIR_SOURCE_DIR}/install)
+    ExternalProject_Add(
+        tt-mlir
+        PREFIX ${TTPJRT_SOURCE_DIR}/third_party/tt-mlir
+        # Installing the python dependencies before the build
+        PATCH_COMMAND TTPJRT_SOURCE_DIR=${TTPJRT_SOURCE_DIR} bash ${TTPJRT_SOURCE_DIR}/venv/install_ttmlir_requirements.sh
+        CMAKE_GENERATOR Ninja
+        BINARY_DIR ${TTMLIR_BUILD_DIR}
+        INSTALL_COMMAND ${CMAKE_COMMAND} --install ${TTMLIR_BUILD_DIR} --component SharedLib
+        CMAKE_ARGS
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=clang-17
+          -DCMAKE_CXX_COMPILER=clang++-17
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          -DTT_RUNTIME_ENABLE_TTNN=ON
+          -DTTMLIR_ENABLE_STABLEHLO=ON
+          -DTTMLIR_ENABLE_RUNTIME=ON
+          -DTTMLIR_ENABLE_BINDINGS_PYTHON=OFF
+          -DCMAKE_INSTALL_PREFIX=${TTMLIR_LIB_DIR}
+        GIT_REPOSITORY https://github.com/tenstorrent/tt-mlir.git
+        GIT_TAG ${TT_MLIR_VERSION}
+        GIT_PROGRESS ON
+    )
+
+    set_target_properties(tt-mlir PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+    install(DIRECTORY ${TTMLIR_LIB_DIR}/ DESTINATION "${CMAKE_INSTALL_PREFIX}")
+
+    # Link to all TTMLIR libraries in ${TTMLIR_INSTALL_DIR}/install/lib
+    set(TTMLIR_LIB_DIR ${TTMLIR_LIB_DIR} PARENT_SCOPE)
+    message(STATUS "Linking to TTMLIR libraries in ${TTMLIR_LIB_DIR}")
+    file(GLOB TTMLIR_LIBRARIES "${TTMLIR_LIB_DIR}/*.so")
+    foreach(TTMLIR_LIBRARY ${TTMLIR_LIBRARIES})
+        get_filename_component(lib_name ${TTMLIR_LIBRARY} NAME_WE)
+        string(REPLACE "lib" "" lib_name ${lib_name}) # Remove the "lib" prefix if it exists
+        add_library(${lib_name} SHARED IMPORTED GLOBAL)
+        set_target_properties(${lib_name} PROPERTIES EXCLUDE_FROM_ALL TRUE IMPORTED_LOCATION ${TTMLIR_LIBRARY})
+        add_dependencies(${lib_name} tt-mlir)
+    endforeach()
+
+    set(FLAGS "${CMAKE_CXX_FLAGS} -fPIC -Wno-undef -Wno-unsafe-buffer-usage -Wno-disabled-macro-expansion")
+    ExternalProject_Add(
+        loguru
+        PREFIX ${TTPJRT_SOURCE_DIR}/third_party/loguru
+        CMAKE_GENERATOR Ninja
+        CMAKE_ARGS
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=clang-17
+          -DCMAKE_CXX_COMPILER=clang++-17
+          -DCMAKE_CXX_FLAGS=${FLAGS}
+          -DCMAKE_INSTALL_PREFIX=${TTPJRT_SOURCE_DIR}/third_party/loguru/src/loguru-install
+        GIT_REPOSITORY https://github.com/emilk/loguru.git
+        GIT_TAG ${LOGURU_VERSION}
+        GIT_PROGRESS ON
+    )
+
+endif()

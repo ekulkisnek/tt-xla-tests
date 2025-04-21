@@ -1,0 +1,109 @@
+# Project
+build/
+install/
+third_party/loguru
+third_party/tt-mlir
+
+# IDE
+.vscode/
+
+# Clangd
+.cache/
+compile_commands.json
+
+# Python
+__pycache__/
+.env
+.venv
+env/
+venv/*
+!venv/activate
+!venv/install_ttmlir_requirements.sh
+.env.sh
+*.egg-info
+*.whl
+
+# Packaging scripts write artifacts here.
+bindist/
+
+# Model weights and large files
+tests/jax/models/qwen2_5/qwen2_5-7b/
+tests/jax/models/qwen2_5/qwen2_5-7b/*
+!tests/jax/models/qwen2_5/qwen2_5-7b/README.md
+!tests/jax/models/qwen2_5/qwen2_5-7b/LICENSE
+!tests/jax/models/qwen2_5/qwen2_5-7b/config.json
+!tests/jax/models/qwen2_5/qwen2_5-7b/tokenizer_config.json
+!tests/jax/models/qwen2_5/qwen2_5-7b/generation_config.json
+!tests/jax/models/qwen2_5/qwen2_5-7b/.gitattributes
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+mesh_eval_results/
+
+# Misc
+.DS_Store
+.env
+.env.local
+.env.*.local
+qwen2.5-7b/model-00001-of-00004.safetensors
+qwen2.5-7b/model-00002-of-00004.safetensors
+qwen2.5-7b/model-00003-of-00004.safetensors
+qwen2.5-7b/model-00004-of-00004.safetensors
+
+# Ignore Qwen2.5 weights
+qwen2.5-weights/
+
+
+
+tests/jax/models/qwen25-weights/model-00001-of-00004.safetensors
+tests/jax/models/qwen25-weights/model-00003-of-00004.safetensors
+tests/jax/models/qwen25-weights/model-00002-of-00004.safetensors
+tests/jax/models/qwen25-weights/model-00004-of-00004.safetensors
+tests/jax/models/qwen25/qwen25-weights/model-00001-of-00004.safetensors
+tests/jax/models/qwen25/qwen25-weights/model-00002-of-00004.safetensors
+tests/jax/models/qwen25/qwen25-weights/model-00003-of-00004.safetensors
+tests/jax/models/qwen25/qwen25-weights/model-00004-of-00004.safetensors
+tests/jax/models/qwen25/qwen25-weights/vocab.json
+tests/jax/models/qwen25/qwen25-weights/tokenizer.json
+tests/jax/models/qwen25/qwen25-weights/.gitattributes
+tests/jax/models/qwen25/qwen25-weights/config.json
+tests/jax/models/qwen25/qwen25-weights/generation_config.json
+tests/jax/models/qwen25/qwen25-weights/LICENSE
+tests/jax/models/qwen25/qwen25-weights/merges.txt
+tests/jax/models/qwen25/qwen25-weights/model.safetensors.index.json
+tests/jax/models/qwen25/qwen25-weights/README.md
+tests/jax/models/qwen25/qwen25-weights/tokenizer_config.json

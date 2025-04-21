@@ -1,0 +1,31 @@
+name: On push
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+    paths-ignore:
+      - '**/*.md'
+      - '.gitignore'
+      - 'LICENSE'
+
+jobs:
+  pre-commit:
+    uses: ./.github/workflows/pre-commit.yml
+    secrets: inherit
+
+  spdx:
+    uses: ./.github/workflows/spdx.yml
+    secrets: inherit
+
+  build-and-test:
+    needs: [pre-commit, spdx]
+    uses: ./.github/workflows/build-and-test.yml
+    secrets: inherit
+    with:
+      build_options: |
+        [
+          {"runs-on": "n150", "name": "run", "dir": "./tests/jax/single_chip"},
+          {"runs-on": "n300", "name": "run", "dir": "./tests/jax/multi_chip/n300"},
+          {"runs-on": "llmbox", "name": "run", "dir": "./tests/jax/multi_chip/llmbox"}
+        ]
