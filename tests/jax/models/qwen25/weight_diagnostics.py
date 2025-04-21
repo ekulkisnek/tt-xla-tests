@@ -11,12 +11,14 @@ import os
 import glob
 import logging
 import json
+import re
 from typing import Dict, List, Optional, Tuple, Union, Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.traverse_util import flatten_dict, unflatten_dict
+from flax.core.frozen_dict import freeze, unfreeze
 
 logger = logging.getLogger(__name__)
 
@@ -453,6 +455,182 @@ def weight_loading_tester(model_path: str) -> Dict[str, Any]:
     
     return results
 
+def create_parameter_structure_report(params: Dict, prefix: str = '') -> Dict[str, Dict]:
+    """
+    Create a detailed report about parameter structure to diagnose issues.
+    
+    Args:
+        params: Parameter dictionary
+        prefix: Optional prefix for parameter paths
+        
+    Returns:
+        Dictionary with parameter structure information
+    """
+    report = {
+        'summary': {
+            'total_params': 0,
+            'total_size_mb': 0,
+            'missing_params': [],
+            'unusual_shapes': [],
+            'unusual_dtypes': [],
+        },
+        'params': {},
+    }
+    
+    # Check if params is directly available or needs extraction
+    if hasattr(params, 'params'):
+        params = params.params
+    
+    # Standard parameter names we expect to find
+    expected_params = [
+        'transformer.embed_tokens',
+        'transformer.h',
+        'transformer.ln_f',
+        'lm_head'
+    ]
+    
+    # Flatten the parameters for easier iteration
+    flat_params = flatten_dict(params)
+    
+    # Check for expected parameters
+    for exp_param in expected_params:
+        found = False
+        for param_path in flat_params.keys():
+            path_str = '.'.join([str(p) for p in param_path])
+            if exp_param in path_str:
+                found = True
+                break
+        
+        if not found:
+            report['summary']['missing_params'].append(exp_param)
+    
+    # Process each parameter
+    for param_path, param_value in flat_params.items():
+        path_str = '.'.join([str(p) for p in param_path])
+        
+        if hasattr(param_value, 'shape'):
+            shape = param_value.shape
+            dtype = param_value.dtype
+            size_bytes = np.prod(shape) * np.dtype(dtype).itemsize
+            size_mb = size_bytes / (1024 * 1024)
+            
+            report['summary']['total_params'] += 1
+            report['summary']['total_size_mb'] += size_mb
+            
+            param_info = {
+                'shape': str(shape),
+                'dtype': str(dtype),
+                'size_mb': round(size_mb, 2),
+            }
+            
+            # Check for unusual shapes (e.g., zero dimensions)
+            if 0 in shape:
+                report['summary']['unusual_shapes'].append(path_str)
+                param_info['issue'] = 'Zero dimension'
+                
+            # Check for unusual dtypes
+            if dtype not in [jnp.float32, jnp.float16, jnp.bfloat16, np.float32, np.float16]:
+                report['summary']['unusual_dtypes'].append(path_str)
+                param_info['issue'] = f'Unusual dtype: {dtype}'
+            
+            report['params'][path_str] = param_info
+    
+    # Round total size
+    report['summary']['total_size_mb'] = round(report['summary']['total_size_mb'], 2)
+    
+    # Check for common structure issues
+    report['structure_analysis'] = analyze_parameter_structure(params)
+    
+    return report
+
+def analyze_parameter_structure(params: Dict) -> Dict[str, Any]:
+    """
+    Analyze the parameter structure for common issues.
+    
+    Args:
+        params: Parameter dictionary
+        
+    Returns:
+        Dictionary with analysis results
+    """
+    analysis = {
+        'issues': [],
+        'recommendations': [],
+    }
+    
+    # Check if params is wrapped with a 'params' key
+    if 'params' in params and isinstance(params['params'], dict):
+        analysis['issues'].append('Parameters are wrapped with a "params" key, might need unwrapping')
+        analysis['recommendations'].append('Consider unwrapping parameters: params = params["params"]')
+    
+    # Check for transformer structure
+    if 'transformer' not in params and 'model' in params:
+        analysis['issues'].append('Using "model" instead of "transformer" as the top-level key')
+        analysis['recommendations'].append('Consider renaming "model" to "transformer" in parameter paths')
+    
+    # Check embedding structure
+    flat_params = flatten_dict(params)
+    has_embedding = False
+    for path in flat_params.keys():
+        path_str = '.'.join([str(p) for p in path])
+        if 'embed_tokens' in path_str:
+            has_embedding = True
+            # Check for different embedding variants
+            if 'embedding' not in path_str and 'weight' in path_str:
+                analysis['issues'].append('Embedding uses "weight" instead of "embedding"')
+                analysis['recommendations'].append('Map "weight" to "embedding" for embedding parameters')
+    
+    if not has_embedding:
+        analysis['issues'].append('Missing embedding parameters')
+        analysis['recommendations'].append('Check if embedding parameters are present under a different name')
+    
+    # Check layer naming convention
+    layer_pattern_h = re.compile(r'transformer\.h\.(\d+)')
+    layer_pattern_layers = re.compile(r'(transformer|model)\.layers\.(\d+)')
+    layer_pattern_layers_underscore = re.compile(r'(transformer|model)\.layers_(\d+)')
+    
+    h_layers = []
+    numeric_layers = []
+    underscore_layers = []
+    
+    for path in flat_params.keys():
+        path_str = '.'.join([str(p) for p in path])
+        
+        if layer_pattern_h.search(path_str):
+            h_layers.append(path_str)
+        
+        if layer_pattern_layers.search(path_str):
+            numeric_layers.append(path_str)
+            
+        if layer_pattern_layers_underscore.search(path_str):
+            underscore_layers.append(path_str)
+    
+    if h_layers and (numeric_layers or underscore_layers):
+        analysis['issues'].append('Mixed layer naming conventions (h.N vs layers.N vs layers_N)')
+        analysis['recommendations'].append('Standardize layer naming to a single convention')
+    
+    # Check attention component naming
+    attn_pattern_alt = re.compile(r'self_attn')
+    attn_pattern_std = re.compile(r'attn')
+    
+    has_alt_attn = False
+    has_std_attn = False
+    
+    for path in flat_params.keys():
+        path_str = '.'.join([str(p) for p in path])
+        
+        if attn_pattern_alt.search(path_str):
+            has_alt_attn = True
+        
+        if attn_pattern_std.search(path_str) and not attn_pattern_alt.search(path_str):
+            has_std_attn = True
+    
+    if has_alt_attn and has_std_attn:
+        analysis['issues'].append('Mixed attention naming conventions (self_attn vs attn)')
+        analysis['recommendations'].append('Standardize attention naming to a single convention')
+    
+    return analysis
+
 def fix_parameter_structure(params: Dict) -> Dict:
     """
     Fix common parameter structure issues.
@@ -463,82 +641,417 @@ def fix_parameter_structure(params: Dict) -> Dict:
     Returns:
         Fixed parameter dictionary
     """
-    if params is None:
-        logger.error("Cannot fix None parameters")
+    # Make a modifiable copy
+    params = unfreeze(params) if hasattr(params, 'unfreeze') else dict(params)
+    
+    # Unwrap params if nested
+    if 'params' in params and isinstance(params['params'], dict) and len(params) == 1:
+        params = params['params']
+    
+    # Handle model/transformer naming
+    if 'model' in params and 'transformer' not in params:
+        params['transformer'] = params['model']
+        del params['model']
+    
+    # Fix embedding parameters
+    if 'transformer' in params:
+        if 'embed_tokens' in params['transformer']:
+            embed = params['transformer']['embed_tokens']
+            
+            # Fix embedding weight vs embedding
+            if 'weight' in embed and 'embedding' not in embed:
+                embed['embedding'] = embed['weight']
+                del embed['weight']
+            
+            # Ensure embedding exists in some form
+            if 'embedding' not in embed and hasattr(embed, 'shape'):
+                # Case where embed_tokens directly points to the tensor
+                params['transformer']['embed_tokens'] = {'embedding': embed}
+    
+    # Fix layer naming conventions
+    layer_keys = {}
+    has_h_format = False
+    has_layers_format = False
+    has_layers_underscore_format = False
+    
+    if 'transformer' in params:
+        tr_keys = list(params['transformer'].keys())
+        
+        # Detect layer format
+        if 'h' in tr_keys:
+            has_h_format = True
+            layer_keys['h'] = params['transformer']['h']
+        if 'layers' in tr_keys:
+            has_layers_format = True
+            layer_keys['layers'] = params['transformer']['layers']
+        if any(k.startswith('layers_') for k in tr_keys):
+            has_layers_underscore_format = True
+            for k in tr_keys:
+                if k.startswith('layers_'):
+                    layer_keys[k] = params['transformer'][k]
+    
+    # Standardize to h format if mixed
+    if (has_h_format and has_layers_format) or (has_h_format and has_layers_underscore_format):
+        pass  # Keep h format, fix others later
+    elif has_layers_format and not has_h_format:
+        # Convert layers to h
+        params['transformer']['h'] = params['transformer']['layers']
+        del params['transformer']['layers']
+    elif has_layers_underscore_format and not has_h_format:
+        # Create h from layers_N
+        if 'h' not in params['transformer']:
+            params['transformer']['h'] = {}
+            
+        for k in list(params['transformer'].keys()):
+            if k.startswith('layers_'):
+                layer_idx = int(k.split('_')[1])
+                params['transformer']['h'][layer_idx] = params['transformer'][k]
+                del params['transformer'][k]
+    
+    # Fix attention component naming
+    if 'transformer' in params and 'h' in params['transformer']:
+        for layer_idx, layer in params['transformer']['h'].items():
+            # Fix self_attn to attn
+            if 'self_attn' in layer and 'attn' not in layer:
+                layer['attn'] = layer['self_attn']
+                del layer['self_attn']
+            
+            # Fix attention component naming
+            if 'attn' in layer:
+                attn = layer['attn']
+                
+                # q_proj -> q
+                for proj_pair in [('q_proj', 'q'), ('k_proj', 'k'), ('v_proj', 'v'), ('o_proj', 'o')]:
+                    old, new = proj_pair
+                    if old in attn and new not in attn:
+                        attn[new] = attn[old]
+                        del attn[old]
+                        
+                    # Fix kernel/weight naming
+                    for w_name in ['kernel', 'weight']:
+                        if new in attn and w_name in attn[new]:
+                            # Ensure consistent kernel naming
+                            if w_name == 'weight' and 'kernel' not in attn[new]:
+                                attn[new]['kernel'] = attn[new]['weight']
+                                del attn[new]['weight']
+    
+    # Fix MLP component naming
+    if 'transformer' in params and 'h' in params['transformer']:
+        for layer_idx, layer in params['transformer']['h'].items():
+            if 'mlp' in layer:
+                mlp = layer['mlp']
+                
+                # Fix MLP component naming
+                for mlp_pair in [
+                    ('gate_proj', 'w1'), 
+                    ('up_proj', 'w2'), 
+                    ('down_proj', 'w3')
+                ]:
+                    old, new = mlp_pair
+                    if old in mlp and new not in mlp:
+                        mlp[new] = mlp[old]
+                        del mlp[old]
+                    
+                    # Fix kernel/weight naming
+                    for w_name in ['kernel', 'weight']:
+                        comp = old if old in mlp else new if new in mlp else None
+                        if comp and w_name in mlp[comp]:
+                            # Ensure consistent kernel naming
+                            if w_name == 'weight' and 'kernel' not in mlp[comp]:
+                                mlp[comp]['kernel'] = mlp[comp]['weight']
+                                del mlp[comp]['weight']
+    
+    # Fix layernorm naming
+    if 'transformer' in params and 'h' in params['transformer']:
+        for layer_idx, layer in params['transformer']['h'].items():
+            # input_layernorm -> ln_1
+            if 'input_layernorm' in layer and 'ln_1' not in layer:
+                layer['ln_1'] = layer['input_layernorm']
+                del layer['input_layernorm']
+            
+            # post_attention_layernorm -> ln_2
+            if 'post_attention_layernorm' in layer and 'ln_2' not in layer:
+                layer['ln_2'] = layer['post_attention_layernorm']
+                del layer['post_attention_layernorm']
+    
+    # Fix final layernorm
+    if 'transformer' in params:
+        if 'norm' in params['transformer'] and 'ln_f' not in params['transformer']:
+            params['transformer']['ln_f'] = params['transformer']['norm']
+            del params['transformer']['norm']
+    
+    # Return potentially frozen parameters
+    return freeze(params) if hasattr(params, 'freeze') else params
+
+def map_parameter_paths(params: Dict) -> Dict:
+    """
+    Apply parameter mapping to handle different path conventions.
+    
+    Args:
+        params: Parameter dictionary
+        
+    Returns:
+        Mapped parameter dictionary
+    """
+    # Unfreeze parameters for modification
+    params = unfreeze(params) if hasattr(params, 'unfreeze') else dict(params)
+    
+    # Flatten the parameters
+    flat_params = flatten_dict(params)
+    
+    # Mapping templates
+    param_path_mappings = {
+        # Embedding weight mappings
+        ('transformer', 'embed_tokens', 'weight'): ('transformer', 'embed_tokens', 'embedding'),
+        ('model', 'embed_tokens', 'weight'): ('transformer', 'embed_tokens', 'embedding'),
+        ('params', 'transformer', 'embed_tokens', 'weight'): ('params', 'transformer', 'embed_tokens', 'embedding'),
+        
+        # Attention component mappings - with layer index handled separately
+        # For standard Transformer path format
+    }
+    
+    # Apply static mappings
+    mapped_params = {}
+    for old_path, value in flat_params.items():
+        if old_path in param_path_mappings:
+            new_path = param_path_mappings[old_path]
+            mapped_params[new_path] = value
+        else:
+            mapped_params[old_path] = value
+    
+    # Handle layer-specific patterns with dynamic layer indices
+    dynamic_mapped_params = {}
+    for path, value in mapped_params.items():
+        new_path = None
+        
+        # Extract path as strings for easier pattern matching
+        path_str = '.'.join(str(p) for p in path)
+        
+        # Handle model.layers.N vs transformer.h.N
+        if 'model.layers.' in path_str:
+            layer_match = re.search(r'model\.layers\.(\d+)', path_str)
+            if layer_match:
+                layer_idx = layer_match.group(1)
+                new_path_str = path_str.replace(f'model.layers.{layer_idx}', f'transformer.h.{layer_idx}')
+                new_path = tuple(new_path_str.split('.'))
+        
+        # Handle transformer.layers.N vs transformer.h.N
+        elif 'transformer.layers.' in path_str:
+            layer_match = re.search(r'transformer\.layers\.(\d+)', path_str)
+            if layer_match:
+                layer_idx = layer_match.group(1)
+                new_path_str = path_str.replace(f'transformer.layers.{layer_idx}', f'transformer.h.{layer_idx}')
+                new_path = tuple(new_path_str.split('.'))
+        
+        # Handle transformer.layers_N vs transformer.h.N
+        elif 'transformer.layers_' in path_str:
+            layer_match = re.search(r'transformer\.layers_(\d+)', path_str)
+            if layer_match:
+                layer_idx = layer_match.group(1)
+                new_path_str = path_str.replace(f'transformer.layers_{layer_idx}', f'transformer.h.{layer_idx}')
+                new_path = tuple(new_path_str.split('.'))
+                
+        # Handle attention naming differences
+        if 'self_attn' in path_str:
+            # q_proj, k_proj, v_proj, o_proj
+            for old_name, new_name in [
+                ('self_attn.q_proj', 'attn.q'),
+                ('self_attn.k_proj', 'attn.k'),
+                ('self_attn.v_proj', 'attn.v'),
+                ('self_attn.o_proj', 'attn.o')
+            ]:
+                if old_name in path_str:
+                    if new_path is None:
+                        new_path_str = path_str
+                    else:
+                        new_path_str = '.'.join(str(p) for p in new_path)
+                    
+                    new_path_str = new_path_str.replace(old_name, new_name)
+                    new_path = tuple(new_path_str.split('.'))
+        
+        # Handle MLP naming differences
+        if 'mlp.' in path_str:
+            # gate_proj -> w1, up_proj -> w2, down_proj -> w3
+            for old_name, new_name in [
+                ('mlp.gate_proj', 'mlp.w1'),
+                ('mlp.up_proj', 'mlp.w2'),
+                ('mlp.down_proj', 'mlp.w3')
+            ]:
+                if old_name in path_str:
+                    if new_path is None:
+                        new_path_str = path_str
+                    else:
+                        new_path_str = '.'.join(str(p) for p in new_path)
+                    
+                    new_path_str = new_path_str.replace(old_name, new_name)
+                    new_path = tuple(new_path_str.split('.'))
+        
+        # Handle layernorm naming differences
+        for old_name, new_name in [
+            ('input_layernorm', 'ln_1'),
+            ('post_attention_layernorm', 'ln_2'),
+            ('norm', 'ln_f')
+        ]:
+            if old_name in path_str:
+                if new_path is None:
+                    new_path_str = path_str
+                else:
+                    new_path_str = '.'.join(str(p) for p in new_path)
+                
+                new_path_str = new_path_str.replace(old_name, new_name)
+                new_path = tuple(new_path_str.split('.'))
+        
+        # Handle weight vs kernel naming
+        if '.weight' in path_str and not any(ln in path_str for ln in ['ln_1.weight', 'ln_2.weight', 'ln_f.weight']):
+            if new_path is None:
+                new_path_str = path_str
+            else:
+                new_path_str = '.'.join(str(p) for p in new_path)
+            
+            new_path_str = new_path_str.replace('.weight', '.kernel')
+            new_path = tuple(new_path_str.split('.'))
+        
+        # Use the new path if it was changed, otherwise use the original path
+        if new_path is not None:
+            dynamic_mapped_params[new_path] = value
+        else:
+            dynamic_mapped_params[path] = value
+    
+    # Convert the mapped paths back to a dictionary
+    mapped_dict = unflatten_dict(dynamic_mapped_params)
+    
+    # Return as frozen dict if the input was frozen
+    return freeze(mapped_dict) if hasattr(params, 'freeze') else mapped_dict
+
+def combine_partial_params(params_list: List[Dict], config=None) -> Dict:
+    """
+    Combine parameters from multiple partial models into a single parameter dictionary.
+    
+    Args:
+        params_list: List of parameter dictionaries to combine
+        config: Optional model configuration to ensure consistent structure
+        
+    Returns:
+        Combined parameter dictionary
+    """
+    if not params_list:
         return {}
     
-    # Check if we need to wrap in 'params'
-    has_params_key = "params" in params
+    # Unfreeze all parameter dictionaries
+    params_list = [unfreeze(p) if hasattr(p, 'unfreeze') else dict(p) for p in params_list]
     
-    # Critical top-level keys that would indicate we need a params wrapper
-    critical_top_keys = ["transformer", "model", "lm_head"]
-    needs_params_wrapper = any(key in params for key in critical_top_keys)
+    # Start with the first parameter set
+    combined_params = dict(params_list[0])
     
-    if not has_params_key and needs_params_wrapper:
-        logger.info("Wrapping parameters in 'params' key")
-        params = {"params": params}
+    # Flatten all parameter dictionaries for easier merging
+    flat_combined = flatten_dict(combined_params)
     
-    # Check for embedding
-    flat_params = flatten_dict(params)
-    has_embedding = False
-    
-    # Check for embedding in tuple keys
-    for key_tuple in flat_params.keys():
-        # Check for embed_tokens.embedding pattern in the key tuple
-        if len(key_tuple) >= 4:
-            # Look for the sequence that would represent embed_tokens.embedding
-            # This could be ('params', 'transformer', 'embed_tokens', 'embedding')
-            # or similar pattern
-            for i in range(len(key_tuple) - 1):
-                if key_tuple[i] == "embed_tokens" and key_tuple[i+1] == "embedding":
-                    has_embedding = True
-                    logger.info(f"Found embedding parameter at key: {key_tuple}")
-                    break
-        if has_embedding:
-            break
-    
-    if not has_embedding:
-        logger.warning("No embedding parameter found (embed_tokens.embedding)")
+    # Merge in the remaining parameter sets
+    for params in params_list[1:]:
+        flat_params = flatten_dict(params)
         
-        # Try to fix by finding embedding-like parameters
-        for key_tuple, value in list(flat_params.items()):
-            # Look for keys containing 'embedding' or 'embed'
-            contains_embed = False
-            for part in key_tuple:
-                if isinstance(part, str) and ("embedding" in part or "embed" in part):
-                    contains_embed = True
-                    break
-                
-            if contains_embed and hasattr(value, "shape"):
-                logger.info(f"Found potential embedding parameter: {key_tuple} with shape {value.shape}")
-                
-                # Try to create embed_tokens.embedding
-                if has_params_key:
-                    # Check if 'transformer' exists in structure
-                    has_transformer = False
-                    for k in flat_params.keys():
-                        if len(k) > 1 and k[0] == "params" and k[1] == "transformer":
-                            has_transformer = True
-                            break
-                    
-                    if has_transformer:
-                        # Add under transformer
-                        new_key = ("params", "transformer", "embed_tokens", "embedding")
-                    else:
-                        # Add at top level
-                        new_key = ("params", "embed_tokens", "embedding")
-                    
-                    flat_params[new_key] = value
-                    logger.info(f"Added embedding parameter at {new_key}")
-                    has_embedding = True
-                    break
+        # Add any missing parameters
+        for path, value in flat_params.items():
+            if path not in flat_combined:
+                flat_combined[path] = value
     
-    # Reconstruct parameters from flat dictionary
-    if flat_params != flatten_dict(params):
-        params = unflatten_dict(flat_params)
-        logger.info("Reconstructed parameters with modified structure")
+    # Unflatten back to a dictionary
+    result = unflatten_dict(flat_combined)
     
-    return params
+    # Fix any structure issues
+    result = fix_parameter_structure(result)
+    
+    # Return as frozen dict
+    return freeze(result) if hasattr(params_list[0], 'freeze') else result
+
+def check_parameter_shapes(params: Dict, config: Dict) -> List[str]:
+    """
+    Check if parameter shapes match the expected shapes based on the configuration.
+    
+    Args:
+        params: Parameter dictionary
+        config: Model configuration
+        
+    Returns:
+        List of parameter paths with shape mismatches
+    """
+    # Extract config values
+    hidden_size = config.get('hidden_size', 4096)
+    intermediate_size = config.get('intermediate_size', 14336)
+    num_attention_heads = config.get('num_attention_heads', 32)
+    head_dim = hidden_size // num_attention_heads
+    
+    # Expected shapes for different parameter types
+    expected_shapes = {
+        'embed_tokens': {
+            'embedding': (config.get('vocab_size', 151936), hidden_size),
+        },
+        'attn': {
+            'q.kernel': (hidden_size, num_attention_heads * head_dim),
+            'k.kernel': (hidden_size, num_attention_heads * head_dim),
+            'v.kernel': (hidden_size, num_attention_heads * head_dim),
+            'o.kernel': (num_attention_heads * head_dim, hidden_size),
+        },
+        'mlp': {
+            'w1.kernel': (hidden_size, intermediate_size),
+            'w2.kernel': (hidden_size, intermediate_size),
+            'w3.kernel': (intermediate_size, hidden_size),
+        },
+        'ln': {
+            'weight': (hidden_size,),
+        },
+        'lm_head': {
+            'weight': (config.get('vocab_size', 151936), hidden_size),
+        }
+    }
+    
+    # Flatten parameters
+    flat_params = flatten_dict(params)
+    
+    # Check for shape mismatches
+    mismatches = []
+    
+    for path, value in flat_params.items():
+        path_str = '.'.join(str(p) for p in path)
+        
+        # Skip non-tensor values
+        if not hasattr(value, 'shape'):
+            continue
+        
+        # Check embed_tokens
+        if 'embed_tokens' in path_str and path_str.endswith('embedding'):
+            expected = expected_shapes['embed_tokens']['embedding']
+            if value.shape != expected:
+                mismatches.append(f"{path_str}: got {value.shape}, expected {expected}")
+        
+        # Check attention components
+        elif 'attn' in path_str:
+            for comp in ['q.kernel', 'k.kernel', 'v.kernel', 'o.kernel']:
+                if path_str.endswith(comp):
+                    expected = expected_shapes['attn'][comp]
+                    if value.shape != expected:
+                        mismatches.append(f"{path_str}: got {value.shape}, expected {expected}")
+        
+        # Check MLP components
+        elif 'mlp' in path_str:
+            for comp in ['w1.kernel', 'w2.kernel', 'w3.kernel']:
+                if path_str.endswith(comp):
+                    expected = expected_shapes['mlp'][comp]
+                    if value.shape != expected:
+                        mismatches.append(f"{path_str}: got {value.shape}, expected {expected}")
+        
+        # Check layer norms
+        elif any(ln in path_str for ln in ['ln_1.weight', 'ln_2.weight', 'ln_f.weight']):
+            if value.shape != expected_shapes['ln']['weight']:
+                mismatches.append(f"{path_str}: got {value.shape}, expected {expected_shapes['ln']['weight']}")
+        
+        # Check lm_head
+        elif path_str.endswith('lm_head.weight'):
+            expected = expected_shapes['lm_head']['weight']
+            if value.shape != expected:
+                mismatches.append(f"{path_str}: got {value.shape}, expected {expected}")
+    
+    return mismatches
 
 if __name__ == "__main__":
     # Set up logging
