@@ -2150,109 +2150,118 @@ def remap_parameter_structure(loaded_params, expected_model_structure):
     Returns:
         Dict with parameters remapped to expected structure
     """
-    logger.info("Remapping parameter structure to match model expectations")
+    logger.info("Remapping parameter structure to match model expectations (memory-efficient version)")
     
-    # Define mappings between different parameter name formats
-    # From PyTorch/Safetensors format to Flax format
-    key_mappings = {
-        # Embeddings
-        "model.embed_tokens.weight": "params/embed_tokens/embedding",
-        
-        # LM Head
-        "lm_head.weight": "params/lm_head/kernel",
-        
-        # Layer norms
-        "model.norm.weight": "params/layers/norm/scale",
-        ".input_layernorm.weight": "/input_layernorm/scale",
-        ".post_attention_layernorm.weight": "/post_attention_layernorm/scale",
-        
-        # Attention
-        ".self_attn.q_proj.weight": "/attention/q_proj/kernel",
-        ".self_attn.k_proj.weight": "/attention/k_proj/kernel",
-        ".self_attn.v_proj.weight": "/attention/v_proj/kernel",
-        ".self_attn.o_proj.weight": "/attention/o_proj/kernel",
-        
-        # Attention biases
-        ".self_attn.q_proj.bias": "/attention/q_proj/bias",
-        ".self_attn.k_proj.bias": "/attention/k_proj/bias",
-        ".self_attn.v_proj.bias": "/attention/v_proj/bias",
-        
-        # MLP
-        ".mlp.gate_proj.weight": "/mlp/gate_proj/kernel",
-        ".mlp.up_proj.weight": "/mlp/up_proj/kernel",
-        ".mlp.down_proj.weight": "/mlp/down_proj/kernel"
+    # This function is completely rewritten to be more memory-efficient
+    # We'll use a direct mapping approach rather than complex string manipulations
+    
+    # First, let's prepare the output structure
+    # Start with a fresh structure to avoid modifying the input
+    output_params = {"params": {"model": {}}}
+    
+    # Initialize the core model components
+    output_params["params"]["model"]["embed_tokens"] = {"embedding": None}
+    output_params["params"]["model"]["layers"] = {
+        "norm": {"scale": None},
+        # Using "layers_N" format instead of just numeric indices
+        # based on the expected parameter structure from the error message
     }
+    output_params["params"]["lm_head"] = {"kernel": None}
     
-    # Flatten both structures for easier manipulation
-    flattened_params = {}
+    # Map core parameters (embeddings, lm_head, final norm)
+    # Handle embeddings
+    if "model.embed_tokens.weight" in loaded_params:
+        output_params["params"]["model"]["embed_tokens"]["embedding"] = loaded_params["model.embed_tokens.weight"]
     
-    # Process loaded parameters
-    if isinstance(loaded_params, dict):
-        if "model" in loaded_params:
-            # This is a nested dictionary with model and lm_head
-            # Combine them with proper prefixes
-            combined = {}
+    # Handle LM head (with transpose)
+    if "lm_head.weight" in loaded_params:
+        output_params["params"]["lm_head"]["kernel"] = loaded_params["lm_head.weight"].T
+    
+    # Handle final norm
+    if "model.norm.weight" in loaded_params:
+        output_params["params"]["model"]["layers"]["norm"] = {"scale": loaded_params["model.norm.weight"]}
+    
+    # Process transformer layers in batches to save memory
+    # Group keys by layer to process each layer completely
+    layer_keys = {}
+    
+    # First pass - identify all layer-specific keys and group them
+    for key in loaded_params:
+        if not isinstance(key, str):
+            # Skip non-string keys to avoid the split error
+            continue
             
-            # Add model parameters with model. prefix
-            for key, value in flatten_dict(loaded_params["model"]).items():
-                if isinstance(key, tuple):
-                    key_str = "model." + ".".join(key)
-                else:
-                    key_str = f"model.{key}"
-                combined[key_str] = value
-            
-            # Add lm_head parameters
-            if "lm_head" in loaded_params:
-                for key, value in flatten_dict(loaded_params["lm_head"]).items():
-                    if isinstance(key, tuple):
-                        key_str = "lm_head." + ".".join(key)
-                    else:
-                        key_str = f"lm_head.{key}"
-                    combined[key_str] = value
-            
-            flattened_params = combined
-        else:
-            # Just flatten as is - likely raw weights
-            tmp_flat = {}
-            for key, value in flatten_dict(loaded_params).items():
-                if isinstance(key, tuple):
-                    key_str = ".".join(key)
-                else:
-                    key_str = key
-                tmp_flat[key_str] = value
-            flattened_params = tmp_flat
-    
-    # Now map to expected structure
-    mapped_params = {}
-    
-    # Special handling for model layers
-    for key, value in flattened_params.items():
-        # First, check for direct matches in key_mappings
-        mapped_key = key
-        for old_pattern, new_pattern in key_mappings.items():
-            if old_pattern in key:
-                mapped_key = key.replace(old_pattern, new_pattern)
-                break
-        
-        # Special handling for layer indices
         if "model.layers." in key:
             # Extract layer index
             import re
             layer_match = re.search(r"model\.layers\.(\d+)", key)
             if layer_match:
                 layer_idx = layer_match.group(1)
-                mapped_key = mapped_key.replace(f"model.layers.{layer_idx}", f"params/layers/layers/{layer_idx}")
-        
-        # Convert string keys to tuples for Flax parameter tree
-        mapped_key_tuple = tuple(mapped_key.split("/"))
-        mapped_params[mapped_key_tuple] = value
-        
-        # Transpose weight matrices if needed (key/value/query/output projections)
-        if '.weight' in key and ('proj' in key or 'mlp.' in key) and 'norm' not in key:
-            # Transpose weight matrices for linear projections
-            # PyTorch: [out_dim, in_dim], JAX: [in_dim, out_dim]
-            if len(value.shape) == 2:  # Only transpose 2D matrices
-                mapped_params[mapped_key_tuple] = value.T
+                if layer_idx not in layer_keys:
+                    layer_keys[layer_idx] = []
+                layer_keys[layer_idx].append(key)
     
-    # Unflatten back to nested structure
-    return unflatten_dict(mapped_params, sep="/")
+    # Now process each layer
+    for layer_idx, keys in layer_keys.items():
+        # Initialize the layer structure with proper layer_N format
+        layer_key = f"layers_{layer_idx}"
+        output_params["params"]["model"]["layers"][layer_key] = {
+            "input_layernorm": {"scale": None},
+            "post_attention_layernorm": {"scale": None},
+            "attention": {
+                "q_proj": {"kernel": None, "bias": None},
+                "k_proj": {"kernel": None, "bias": None},
+                "v_proj": {"kernel": None, "bias": None},
+                "o_proj": {"kernel": None}
+            },
+            "mlp": {
+                "gate_proj": {"kernel": None},
+                "up_proj": {"kernel": None},
+                "down_proj": {"kernel": None},
+            }
+        }
+        
+        # Process all keys for this layer
+        for key in keys:
+            # Layer norms
+            if "input_layernorm.weight" in key:
+                output_params["params"]["model"]["layers"][layer_key]["input_layernorm"]["scale"] = loaded_params[key]
+            elif "post_attention_layernorm.weight" in key:
+                output_params["params"]["model"]["layers"][layer_key]["post_attention_layernorm"]["scale"] = loaded_params[key]
+            
+            # Self-attention weights (with transpose)
+            elif "self_attn.q_proj.weight" in key:
+                output_params["params"]["model"]["layers"][layer_key]["attention"]["q_proj"]["kernel"] = loaded_params[key].T
+            elif "self_attn.k_proj.weight" in key:
+                output_params["params"]["model"]["layers"][layer_key]["attention"]["k_proj"]["kernel"] = loaded_params[key].T
+            elif "self_attn.v_proj.weight" in key:
+                output_params["params"]["model"]["layers"][layer_key]["attention"]["v_proj"]["kernel"] = loaded_params[key].T
+            elif "self_attn.o_proj.weight" in key:
+                output_params["params"]["model"]["layers"][layer_key]["attention"]["o_proj"]["kernel"] = loaded_params[key].T
+            
+            # Self-attention biases
+            elif "self_attn.q_proj.bias" in key:
+                output_params["params"]["model"]["layers"][layer_key]["attention"]["q_proj"]["bias"] = loaded_params[key]
+            elif "self_attn.k_proj.bias" in key:
+                output_params["params"]["model"]["layers"][layer_key]["attention"]["k_proj"]["bias"] = loaded_params[key]
+            elif "self_attn.v_proj.bias" in key:
+                output_params["params"]["model"]["layers"][layer_key]["attention"]["v_proj"]["bias"] = loaded_params[key]
+            
+            # MLP weights (with transpose)
+            elif "mlp.gate_proj.weight" in key:
+                output_params["params"]["model"]["layers"][layer_key]["mlp"]["gate_proj"]["kernel"] = loaded_params[key].T
+            elif "mlp.up_proj.weight" in key:
+                output_params["params"]["model"]["layers"][layer_key]["mlp"]["up_proj"]["kernel"] = loaded_params[key].T
+            elif "mlp.down_proj.weight" in key:
+                output_params["params"]["model"]["layers"][layer_key]["mlp"]["down_proj"]["kernel"] = loaded_params[key].T
+    
+    # Remove any None values that weren't filled
+    def remove_none_values(d):
+        if isinstance(d, dict):
+            return {k: remove_none_values(v) for k, v in d.items() if v is not None}
+        return d
+    
+    # Clean up the parameter structure
+    output_params = remove_none_values(output_params)
+    
+    return output_params

@@ -19,6 +19,7 @@ import numpy as np
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.sharding import Mesh, PartitionSpec as P
 from safetensors.flax import load_file as safe_load_file
+from safetensors import safe_open
 from transformers.modeling_flax_pytorch_utils import load_pytorch_checkpoint_in_flax_state_dict
 from transformers.utils import logging as transformers_logging
 
@@ -198,210 +199,172 @@ def load_qwen_weights(
     
     Args:
         model_path: Path to model checkpoint files
-        model: The initialized Flax model
-        config: Model configuration dictionary
-        mesh: Optional JAX mesh for tensor parallelism
-        param_dtype: Data type for parameters
+        model: Flax model to load weights for
+        config: Model configuration dictionary 
+        mesh: JAX device mesh for tensor parallelism
+        param_dtype: Parameter dtype
         debug: Whether to print debug information
         
     Returns:
         Dictionary of model parameters
     """
-    start_time = time.time()
-    
     logger.info(f"Loading weights from {model_path}")
     
-    # Get all checkpoint files
-    checkpoint_files = get_checkpoint_files(model_path)
+    # Find checkpoint files
+    checkpoint_files = None
+    try:
+        checkpoint_files = get_checkpoint_files(model_path)
+        is_sharded = len(checkpoint_files) > 1
+        logger.info(f"Found {'sharded' if is_sharded else 'single'} checkpoint with {len(checkpoint_files)} file(s)")
+    except FileNotFoundError:
+        logger.error(f"No checkpoint files found in {model_path}")
+        raise
     
-    # Check if we need to shard the weights
-    is_sharded = len(checkpoint_files) > 1
-    logger.info(f"Found {'sharded' if is_sharded else 'single'} checkpoint with {len(checkpoint_files)} file(s)")
-    
-    # Apply our patches for PyTorch compatibility
+    # Apply PyTorch patches to avoid potential loading issues
     patch_torch_load()
     patch_transformers_load_function()
     
-    # Track which loading methods we've tried
-    attempted_methods = []
-    flax_state_dict = None
+    # Determine if we're loading from safetensors or PyTorch files
+    is_safetensors = all(f.endswith('.safetensors') for f in checkpoint_files)
     
-    # Method 1: First try direct loading with safetensors (most reliable)
-    if checkpoint_files[0].endswith('.safetensors'):
+    # First attempt: try loading with safetensors (preferred method)
+    if is_safetensors:
+        logger.info("Attempting to load directly with safetensors (preferred method)...")
         try:
-            logger.info("Attempting to load directly with safetensors (preferred method)...")
-            attempted_methods.append("safetensors_direct")
-            
-            # Use the improved load_safetensors_only function which handles 
-            # parameter structure and embedding issues
-            flax_state_dict = load_safetensors_only(
+            params = load_safetensors_weights(
                 model_path=model_path,
+                model=model,
                 config=config,
                 mesh=mesh,
                 param_dtype=param_dtype
             )
-            
-            logger.info("Successfully loaded weights directly from safetensors")
+            logger.info("Successfully loaded weights using safetensors")
+            return params
         except Exception as e:
             logger.warning(f"Direct safetensors loading failed: {e}")
             logger.warning("Falling back to alternative methods...")
     
-    # Method 2: Try HuggingFace's safe_load_file if direct method failed
-    if flax_state_dict is None and checkpoint_files[0].endswith('.safetensors'):
-        try:
-            logger.info("Attempting to load with HuggingFace safe_load_file...")
-            attempted_methods.append("hf_safe_load")
-            
-            from safetensors.flax import load_file as safe_load_file
-            
-            # For sharded files, we need to load and merge them
-            if is_sharded:
-                all_params = {}
-                for file in checkpoint_files:
-                    logger.info(f"Loading safetensors file: {file}")
-                    params = safe_load_file(file)
-                    all_params.update(params)
-                
-                # Unflatten params and ensure it has the right structure
-                flax_state_dict = unflatten_dict(all_params, sep=".")
-                # Wrap in params if needed
-                if "transformer" in flax_state_dict and "params" not in flax_state_dict:
-                    flax_state_dict = {"params": flax_state_dict}
-            else:
-                # Single file - simpler case
-                params = safe_load_file(checkpoint_files[0])
-                flax_state_dict = unflatten_dict(params, sep=".")
-                # Wrap in params if needed
-                if "transformer" in flax_state_dict and "params" not in flax_state_dict:
-                    flax_state_dict = {"params": flax_state_dict}
-            
-            logger.info("Successfully loaded weights using HuggingFace safetensors utilities")
-        except Exception as e:
-            logger.warning(f"HuggingFace safetensors loading failed: {e}")
+    # Second attempt: try loading with HuggingFace transformers utilities
+    logger.info("Attempting to load with HuggingFace utilities...")
     
-    # Method 3: Last resort - try PyTorch loading path with transformers
-    if flax_state_dict is None:
-        try:
-            logger.info("Attempting to load with transformers PyTorch→Flax conversion...")
-            attempted_methods.append("transformers_pytorch_flax")
-            
-            # Use the patched version to handle weights_only issue
-            flax_state_dict = load_pytorch_checkpoint_in_flax_state_dict(
-                model, model_path, is_sharded=is_sharded, allow_missing_keys=True
-            )
-            
-            # Check if the structure is correct
-            if flax_state_dict is not None:
-                # Examine the structure
-                keys = list(flax_state_dict.keys())
-                if len(keys) > 0 and "params" not in flax_state_dict:
-                    # We need to wrap the state dict in a 'params' dictionary
-                    logger.info("Wrapping state dict with 'params' key")
-                    flax_state_dict = {"params": flax_state_dict}
-            
-            logger.info(f"Successfully loaded weights using transformers PyTorch→Flax conversion")
-        except Exception as e:
-            logger.error(f"Error with transformers PyTorch→Flax conversion: {e}")
-    
-    # If we got here and flax_state_dict is still None, all loading methods failed
-    if flax_state_dict is None:
-        methods_string = ", ".join(attempted_methods)
-        error_msg = f"Failed to load weights from {model_path} after trying: {methods_string}"
-        logger.error(error_msg)
+    # For safetensors files, use HuggingFace's safe_load_file
+    if is_safetensors:
+        logger.info("Loading with HuggingFace safe_load_file...")
         
-        # Try random initialization as last resort
-        logger.warning("All loading methods failed. Consider initializing with random weights instead.")
-        raise ValueError(error_msg)
-    
-    # Verify the embed_tokens.embedding parameter exists
-    has_embedding = False
-    flat_dict = flatten_dict(flax_state_dict)
-    
-    # Check specifically for embed_tokens.embedding in any nested structure
-    for key in flat_dict:
-        if "embed_tokens.embedding" in key:
-            has_embedding = True
-            logger.info(f"Found embedding parameter at key: {key}")
-            break
-    
-    if not has_embedding:
-        # Try to find any embedding-related parameter and convert it
-        embedding_keys = [k for k in flat_dict.keys() if "embed" in k]
-        if embedding_keys:
-            logger.warning(f"No embed_tokens.embedding found, but found embedding keys: {embedding_keys}")
-            # Try to fix by checking for embed_tokens.weight or similar
-            for old_key in list(flat_dict.keys()):
-                if "embed_tokens.weight" in old_key or "wte.weight" in old_key:
-                    # Determine the new key by replacing weight with embedding
-                    if "embed_tokens.weight" in old_key:
-                        new_key = old_key.replace("embed_tokens.weight", "embed_tokens.embedding")
-                    else:
-                        new_key = old_key.replace("wte.weight", "embed_tokens.embedding")
-                    logger.info(f"Converting {old_key} to {new_key}")
-                    flat_dict[new_key] = flat_dict[old_key]
-            # Rebuild flax_state_dict
-            flax_state_dict = unflatten_dict(flat_dict)
-        else:
+        # Load each file and combine
+        all_params = {}
+        for file_path in checkpoint_files:
+            logger.info(f"Loading safetensors file: {file_path}")
+            try:
+                file_params = safe_load_file(file_path)
+                all_params.update(file_params)
+            except Exception as e:
+                logger.error(f"Error loading {file_path}: {e}")
+                raise
+        
+        # Convert to the expected format
+        params = {"params": {}}
+        
+        # Process the embedding weights first
+        embedding_found = False
+        for key, value in all_params.items():
+            if "embed_tokens.weight" in key:
+                embedding_found = True
+                # Create the embedding parameter structure
+                if "transformer" not in params["params"]:
+                    params["params"]["transformer"] = {}
+                
+                if "embed_tokens" not in params["params"]["transformer"]:
+                    params["params"]["transformer"]["embed_tokens"] = {}
+                
+                # Set the embedding parameter with correct name
+                params["params"]["transformer"]["embed_tokens"]["embedding"] = jnp.array(value, dtype=param_dtype)
+                logger.info(f"Loaded embedding weights with shape {value.shape}")
+                break
+        
+        if not embedding_found:
             logger.warning("No embedding parameters found - may cause errors!")
+        
+        # Process remaining parameters
+        for key, value in all_params.items():
+            if "embed_tokens.weight" in key:
+                # Already handled above
+                continue
+                
+            # Convert PyTorch key to Flax path
+            flax_path = convert_pt_key_to_flax(key)
+            
+            if flax_path:
+                # Build nested dictionary from path
+                current = params
+                for path_part in flax_path[:-1]:
+                    if path_part not in current:
+                        current[path_part] = {}
+                    current = current[path_part]
+                
+                # Set the actual parameter value
+                current[flax_path[-1]] = jnp.array(value, dtype=param_dtype)
+        
+        # Apply tensor parallelism if mesh is provided
+        if mesh is not None:
+            logger.info(f"Applying tensor parallelism with mesh shape {mesh.devices.shape}")
+            
+            # Use JAX's device_put to distribute parameters according to partition specs
+            with mesh:
+                params = jax.device_put(params, jax.sharding.NamedSharding(mesh, P()))
+        
+        logger.info("Successfully loaded weights using HuggingFace safetensors utilities")
+        return params
     
-    # Apply tensor parallelism if mesh is provided
-    if mesh is not None:
-        logger.info(f"Applying tensor parallelism with mesh shape {mesh.devices.shape}")
-        
-        # Create partition specs for the model parameters
-        partition_specs = get_partition_specs(config)
-        
-        # Flatten the partition specs for easier lookup
-        flat_partition_specs = flatten_dict(partition_specs)
-        
-        # Flatten the state dict for easier modification
-        flat_state_dict = flatten_dict(flax_state_dict)
-        
-        # Apply sharding to each parameter
+    # For PyTorch .bin files, use load_pytorch_checkpoint_in_flax_state_dict
+    logger.info("Loading with HuggingFace transformers PyTorch utilities...")
+    try:
+        # Create a temporary model state to initialize parameters
         with mesh:
-            for key, param in flat_state_dict.items():
-                # Skip non-array values
-                if not isinstance(param, (np.ndarray, jnp.ndarray)):
-                    continue
-                
-                # Find the matching partition spec
-                spec_key = key
-                if isinstance(spec_key, tuple) and len(spec_key) > 0 and spec_key[0] == "params":
-                    # Remove 'params' prefix for matching against flat_partition_specs
-                    spec_key = spec_key[1:]
-                
-                # Convert to JAX array if needed
-                if isinstance(param, np.ndarray):
-                    param = jnp.array(param, dtype=param_dtype)
-                
-                # Try to find the partition spec for this parameter
-                if spec_key in flat_partition_specs:
-                    spec = flat_partition_specs[spec_key]
-                    
-                    # Apply the partition spec
-                    if spec is not None:
-                        # Create a sharded array
-                        flat_state_dict[key] = jax.device_put(param, jax.sharding.NamedSharding(mesh, spec))
-                        
-                        if debug:
-                            logger.info(f"Applied partition spec {spec} to {key}")
-                    else:
-                        # No sharding needed for this parameter
-                        flat_state_dict[key] = jax.device_put(param)
-                else:
-                    # No partition spec found, don't shard
-                    flat_state_dict[key] = jax.device_put(param)
-                    
-                    if debug:
-                        logger.info(f"No partition spec found for {key}")
+            # Generate a random key for initialization
+            rng = jax.random.PRNGKey(0)
+            
+            # Create init batch
+            batch_size = mesh.shape[0] if mesh is not None and len(mesh.shape) > 0 else 1
+            seq_len = 1
+            init_batch = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
+            
+            # Initialize parameters with dummy values
+            params = model.init(rng, input_ids=init_batch)
         
-        # Unflatten the state dict
-        flax_state_dict = unflatten_dict(flat_state_dict)
-    
-    load_time = time.time() - start_time
-    logger.info(f"Weight loading completed in {load_time:.2f} seconds")
-    
-    return flax_state_dict
+        # Now load the real weights on top of the init structure
+        params = load_pytorch_checkpoint_in_flax_state_dict(
+            model,
+            checkpoint_files,
+            is_sharded=is_sharded,
+            allow_missing_keys=True
+        )
+        
+        # Check if we have embedding weights
+        embedding_found = False
+        if "params" in params and "transformer" in params["params"]:
+            if "embed_tokens" in params["params"]["transformer"]:
+                if "embedding" in params["params"]["transformer"]["embed_tokens"]:
+                    embedding_found = True
+                    logger.info("Found embedding weights in loaded parameters")
+        
+        if not embedding_found:
+            logger.warning("No embedding parameters found in loaded weights - may cause errors!")
+        
+        # Apply tensor parallelism if mesh is provided
+        if mesh is not None:
+            logger.info("Applying tensor parallelism with mesh shape {mesh.devices.shape}")
+            
+            # Use JAX's device_put to distribute parameters according to partition specs
+            with mesh:
+                params = jax.device_put(params, jax.sharding.NamedSharding(mesh, P()))
+        
+        logger.info("Weight loading completed in {time.time() - start_time:.2f} seconds")
+        return params
+        
+    except Exception as e:
+        logger.error(f"Error loading weights: {e}")
+        raise
 
 def load_safetensors_weights(
     model_path: str,
@@ -411,52 +374,144 @@ def load_safetensors_weights(
     param_dtype: jnp.dtype = jnp.bfloat16,
 ) -> Dict:
     """
-    Load weights directly from safetensors files.
+    Load weights from safetensors files and convert to Flax format.
     
     Args:
-        model_path: Path to model checkpoint files
-        model: The initialized Flax model
-        config: Model configuration dictionary
+        model_path: Path to safetensors files
+        model: Flax model to load weights for
+        config: Model configuration
         mesh: Optional JAX mesh for tensor parallelism
         param_dtype: Data type for parameters
         
     Returns:
-        Dictionary of model parameters
+        Dict: Dictionary of model parameters in Flax format
     """
-    # Find the safetensors file
-    if os.path.isdir(model_path):
-        safetensors_file = os.path.join(model_path, "model.safetensors")
-        if not os.path.exists(safetensors_file):
-            # Try to find any safetensors file
-            safetensors_files = glob.glob(os.path.join(model_path, "*.safetensors"))
-            if safetensors_files:
-                safetensors_file = safetensors_files[0]
-            else:
-                raise FileNotFoundError(f"No safetensors file found in {model_path}")
+    logger.info(f"Loading safetensors weights from {model_path}")
+    
+    # Get index file if available
+    index_file = os.path.join(model_path, "model.safetensors.index.json")
+    weight_map = {}
+    
+    if os.path.exists(index_file):
+        logger.info(f"Found safetensors index file: {index_file}")
+        import json
+        with open(index_file, "r") as f:
+            index = json.load(f)
+            weight_map = index.get("weight_map", {})
+            files = sorted(list(set(weight_map.values())))
+            logger.info(f"Found {len(files)} safetensors files in index")
     else:
-        safetensors_file = model_path
+        # Find safetensors files in the directory
+        safetensors_files = get_checkpoint_files(model_path)
+        files = [os.path.basename(f) for f in safetensors_files]
+        logger.info(f"Found {len(files)} safetensors files in directory")
     
-    logger.info(f"Loading safetensors weights from {safetensors_file}")
+    # Create a raw params dictionary with original PyTorch names
+    raw_params = {}
     
-    # Load the weights directly
-    params = safe_load_file(safetensors_file)
+    # Track if we found embedding weights
+    found_embedding = False
     
-    # Convert string keys with dots to tuple keys for unflatten_dict
-    tuple_params = {}
-    for key, value in params.items():
-        key_tuple = tuple(key.split('.'))
-        tuple_params[key_tuple] = value
+    # Load weights from each file
+    for file_name in files:
+        file_path = os.path.join(model_path, file_name)
+        if not os.path.exists(file_path):
+            logger.warning(f"File not found: {file_path}")
+            continue
+            
+        logger.info(f"Loading weights from {file_name}")
+        
+        try:
+            # Use safe_open to load weights from safetensors file
+            with safe_open(file_path, framework="numpy") as f:
+                for key in f.keys():
+                    # Load the tensor as numpy array
+                    tensor = f.get_tensor(key)
+                    
+                    # Check for embedding weights
+                    if "embed_tokens.weight" in key:
+                        found_embedding = True
+                        logger.info(f"Found embedding weights: {key} with shape {tensor.shape}")
+                    
+                    # Store with original name
+                    raw_params[key] = tensor
+        except Exception as e:
+            logger.warning(f"Error loading {file_path}: {e}")
+            # Fallback to HuggingFace's safe_load_file
+            try:
+                logger.info(f"Trying fallback with HuggingFace's safe_load_file")
+                file_params = safe_load_file(file_path)
+                for key, tensor in file_params.items():
+                    # Check for embedding weights
+                    if "embed_tokens.weight" in key:
+                        found_embedding = True
+                        logger.info(f"Found embedding weights: {key} with shape {tensor.shape}")
+                    
+                    # Store with original name
+                    raw_params[key] = tensor
+            except Exception as e2:
+                logger.error(f"Both loading methods failed for {file_path}: {e2}")
+                raise
     
-    # Unflatten the dictionary
-    params = unflatten_dict(tuple_params)
+    logger.info(f"Loaded {len(raw_params)} raw parameters")
+    
+    # Now convert to Flax parameter structure
+    flax_params = {}
+    
+    # Process each parameter
+    for key, tensor in raw_params.items():
+        # Convert PyTorch key to Flax path
+        flax_path = convert_pt_key_to_flax(key)
+        
+        if flax_path:
+            # Convert to JAX array with correct dtype
+            tensor_jax = jnp.array(tensor, dtype=param_dtype)
+            
+            # Build nested dictionary from path
+            current = flax_params
+            for path_part in flax_path[:-1]:
+                if path_part not in current:
+                    current[path_part] = {}
+                current = current[path_part]
+            
+            # Set the actual parameter value
+            current[flax_path[-1]] = tensor_jax
+        else:
+            logger.warning(f"Could not map parameter: {key}")
+    
+    # Check if we found and mapped the embedding
+    if "transformer" in flax_params.get("params", {}) and "embed_tokens" in flax_params["params"]["transformer"]:
+        if "embedding" in flax_params["params"]["transformer"]["embed_tokens"]:
+            logger.info("Successfully mapped embedding weights")
+        else:
+            logger.warning("Embedding weights not properly mapped")
+    elif found_embedding:
+        logger.warning("Found embedding weights but failed to map them correctly")
+    else:
+        logger.warning("No embedding weights found in safetensors files")
     
     # Apply tensor parallelism if mesh is provided
     if mesh is not None:
-        # This would need additional logic to apply the sharding
-        # Similar to load_qwen_weights
-        logger.warning("Tensor parallelism for direct safetensors loading is not fully implemented")
+        logger.info(f"Applying tensor parallelism with mesh shape {mesh.devices.shape}")
+        partition_specs = get_partition_specs(config)
+        
+        with mesh:
+            # Use JAX's device_put to distribute parameters according to partition specs
+            from flax.core.frozen_dict import freeze, unfreeze
+            
+            # Apply constraints to params
+            param_specs = {}
+            for key, value in partition_specs.items():
+                if key.startswith("model."):
+                    flax_key = convert_pt_key_to_flax(key)
+                    if flax_key:
+                        param_specs[tuple(flax_key)] = value
+            
+            # Apply sharding using the partition specs
+            flax_params = jax.device_put(flax_params, jax.sharding.NamedSharding(mesh, P()))
     
-    return params
+    logger.info("Finished loading and converting safetensors weights")
+    return flax_params
 
 def init_model_from_weights(
     model_class,
@@ -946,87 +1001,99 @@ def load_safetensors_only(
 
 def convert_pt_key_to_flax(pt_key, prefix="model."):
     """
-    Convert PyTorch parameter key to Flax format.
+    Convert PyTorch parameter key to Flax parameter key.
     
     Args:
-        pt_key: PyTorch parameter key
-        prefix: Prefix to remove from key
+        pt_key: PyTorch parameter key (e.g., model.layers.0.self_attn.q_proj.weight)
+        prefix: Prefix to check for in the key (default: "model.")
         
     Returns:
-        Tuple: Flax parameter key or None if not mappable
+        List of strings representing the path in a nested Flax parameter dictionary
     """
-    # Strip prefix if it exists
+    # Create a list for the parameter path segments
+    flax_path = ["params"]  # Always put parameters under "params"
+    
+    # Special case: embedding layer
+    if "embed_tokens.weight" in pt_key:
+        return ["params", "transformer", "embed_tokens", "embedding"]
+    
+    # Special case: LM head
+    if "lm_head.weight" in pt_key:
+        return ["params", "lm_head", "kernel"]
+    
+    # Special case: final norm
+    if "model.norm.weight" in pt_key:
+        return ["params", "transformer", "ln_f", "weight"]
+    
+    # Handle the transformer block parameters
     if pt_key.startswith(prefix):
-        pt_key = pt_key[len(prefix):]
+        # Remove the prefix
+        key = pt_key[len(prefix):]
+        
+        # Split by dots to get components
+        parts = key.split(".")
+        
+        # Check if this is a layer parameter
+        if parts[0] == "layers" and len(parts) > 1:
+            layer_idx = parts[1]
+            flax_path.extend(["transformer", "h", layer_idx])
+            
+            # Handle different components of the layer
+            if len(parts) > 2:
+                component = parts[2]
+                
+                # Handle attention components
+                if component == "self_attn":
+                    if parts[3] == "q_proj":
+                        flax_path.extend(["attn", "q"])
+                    elif parts[3] == "k_proj":
+                        flax_path.extend(["attn", "k"])
+                    elif parts[3] == "v_proj":
+                        flax_path.extend(["attn", "v"])
+                    elif parts[3] == "o_proj":
+                        flax_path.extend(["attn", "o"])
+                    else:
+                        flax_path.extend(["attn", parts[3]])
+                        
+                    # Handle weight/bias
+                    if parts[4] == "weight":
+                        flax_path.append("kernel")
+                    else:
+                        flax_path.append(parts[4])
+                
+                # Handle MLP components
+                elif component == "mlp":
+                    if parts[3] == "gate_proj":
+                        flax_path.extend(["mlp", "w1"])
+                    elif parts[3] == "up_proj":
+                        flax_path.extend(["mlp", "w2"])
+                    elif parts[3] == "down_proj":
+                        flax_path.extend(["mlp", "w3"])
+                    else:
+                        flax_path.extend(["mlp", parts[3]])
+                        
+                    # Handle weight/bias
+                    if parts[4] == "weight":
+                        flax_path.append("kernel")
+                    else:
+                        flax_path.append(parts[4])
+                
+                # Handle LayerNorm components
+                elif component == "input_layernorm":
+                    flax_path.extend(["ln_1", "weight"])
+                elif component == "post_attention_layernorm":
+                    flax_path.extend(["ln_2", "weight"])
+                else:
+                    # Fallback for other components
+                    flax_path.append(component)
+        else:
+            # Fallback for other parameters
+            flax_path.extend(["transformer"] + parts)
+    else:
+        # Not a model parameter
+        flax_path.extend([pt_key])
     
-    # Map PyTorch key to Flax key
-    if "layers." in pt_key:
-        # Extract layer index
-        layer_parts = pt_key.split(".")
-        layer_idx = None
-        
-        for i, part in enumerate(layer_parts):
-            if part == "layers":
-                layer_idx = int(layer_parts[i + 1])
-                break
-        
-        if layer_idx is None:
-            return None
-        
-        # Convert the key
-        if "input_layernorm.weight" in pt_key:
-            return ("params", "transformer", f"layers_{layer_idx}", "input_layernorm", "kernel")
-        
-        elif "post_attention_layernorm.weight" in pt_key:
-            return ("params", "transformer", f"layers_{layer_idx}", "post_attention_layernorm", "kernel")
-        
-        elif "self_attn.q_proj.weight" in pt_key:
-            return ("params", "transformer", f"layers_{layer_idx}", "self_attn", "q_proj", "kernel")
-        
-        elif "self_attn.k_proj.weight" in pt_key:
-            return ("params", "transformer", f"layers_{layer_idx}", "self_attn", "k_proj", "kernel")
-        
-        elif "self_attn.v_proj.weight" in pt_key:
-            return ("params", "transformer", f"layers_{layer_idx}", "self_attn", "v_proj", "kernel")
-        
-        elif "self_attn.o_proj.weight" in pt_key:
-            return ("params", "transformer", f"layers_{layer_idx}", "self_attn", "o_proj", "kernel")
-        
-        elif "self_attn.q_proj.bias" in pt_key:
-            return ("params", "transformer", f"layers_{layer_idx}", "self_attn", "q_proj", "bias")
-        
-        elif "self_attn.k_proj.bias" in pt_key:
-            return ("params", "transformer", f"layers_{layer_idx}", "self_attn", "k_proj", "bias")
-        
-        elif "self_attn.v_proj.bias" in pt_key:
-            return ("params", "transformer", f"layers_{layer_idx}", "self_attn", "v_proj", "bias")
-        
-        elif "mlp.gate_proj.weight" in pt_key:
-            return ("params", "transformer", f"layers_{layer_idx}", "mlp", "gate_proj", "kernel")
-        
-        elif "mlp.up_proj.weight" in pt_key:
-            return ("params", "transformer", f"layers_{layer_idx}", "mlp", "up_proj", "kernel")
-        
-        elif "mlp.down_proj.weight" in pt_key:
-            return ("params", "transformer", f"layers_{layer_idx}", "mlp", "down_proj", "kernel")
-        
-        elif "mlp.gate_proj.bias" in pt_key:
-            return ("params", "transformer", f"layers_{layer_idx}", "mlp", "gate_proj", "bias")
-        
-        elif "mlp.up_proj.bias" in pt_key:
-            return ("params", "transformer", f"layers_{layer_idx}", "mlp", "up_proj", "bias")
-        
-        elif "mlp.down_proj.bias" in pt_key:
-            return ("params", "transformer", f"layers_{layer_idx}", "mlp", "down_proj", "bias")
-    
-    elif "norm.weight" in pt_key:
-        return ("params", "transformer", "norm", "kernel")
-    
-    elif "lm_head.weight" in pt_key:
-        return ("params", "lm_head", "kernel")
-    
-    # Default: return None for unrecognized keys
-    return None
+    return flax_path
 
 # Alias for backward compatibility
 direct_load_safetensors = load_safetensors_only 

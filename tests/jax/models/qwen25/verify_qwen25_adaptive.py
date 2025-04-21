@@ -84,6 +84,7 @@ from tensor_parallel import (
     TensorParallelQwen2ForCausalLM,
     create_device_mesh,
     get_partition_specs,
+    load_params_from_checkpoint,
 )
 from config import load_qwen_config, get_qwen2_7b_config
 from weight_loading import load_qwen_weights, load_partial_qwen_weights
@@ -903,7 +904,7 @@ def verify_adaptive_model(
                     else:
                         # For full-sized model, use the model's built-in weight loading
                         logger.info(colored("Using direct checkpoint loading for full-sized model", Colors.CYAN))
-                        params = model.params_from_checkpoint(model_path)
+                        params = load_params_from_checkpoint(model, model_path)
                         logger.info(colored(f"✅ Model weights loaded in {time.time() - start_time:.2f} seconds", Colors.GREEN))
                         
                 except Exception as e:

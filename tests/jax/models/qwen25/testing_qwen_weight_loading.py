@@ -15,6 +15,9 @@ It tests all weight loading methods and verifies that:
 3. The model can perform a simple forward pass with the loaded weights
 
 Usage:
+
+source venv/bin/activate
+
 python testing_qwen_weight_loading.py --weights_dir /root/wrkdir/tt-xla/tests/jax/models/qwen25/qwen25-weights
 
 python testing_qwen_weight_loading.py --weights_dir /root/wrkdir/tt-xla/tests/jax/models/qwen25/qwen25-weights --method all --test_forward
@@ -26,8 +29,10 @@ import os
 import sys
 import time
 import json
+import glob
 import logging
 import argparse
+import msgpack
 from pathlib import Path
 from typing import Dict, Any, Optional, Union, Tuple
 
@@ -74,327 +79,77 @@ except ImportError:
     logger.error("pip install transformers safetensors")
     sys.exit(1)
 
+# Add weight cache at the module level
+_weight_cache = {}
 
-def scan_checkpoint_files(model_path: str) -> Dict[str, Any]:
+def log_tensor_sizes(params, top_n=10):
     """
-    Scan the checkpoint directory and return information about available files.
+    Log the sizes of the largest tensors in the parameter dictionary.
+    This helps identify which tensors are consuming the most memory.
     
     Args:
-        model_path: Path to the model directory
+        params: Parameter dictionary to analyze
+        top_n: Number of largest tensors to log
         
     Returns:
-        Dict containing information about available files
+        List of (key, size_mb) tuples for the largest tensors
     """
-    import glob
+    logger.info("Analyzing tensor sizes to identify memory usage...")
+    flat_params = flatten_dict(params)
     
-    result = {
-        "safetensors": [],
-        "safetensors_index": None,
-        "config": None,
-        "tokenizer_files": []
-    }
+    # Calculate size of each tensor
+    tensor_sizes = []
+    total_size_mb = 0
     
-    # Check for safetensors index
-    index_file = os.path.join(model_path, "model.safetensors.index.json")
-    if os.path.exists(index_file):
-        result["safetensors_index"] = index_file
-        
-        # Read index to get files
-        with open(index_file, "r") as f:
-            index = json.load(f)
-            if "weight_map" in index:
-                weight_map = index["weight_map"]
-                files = sorted(list(set(weight_map.values())))
-                result["safetensors"] = [os.path.join(model_path, f) for f in files]
+    for key, tensor in flat_params.items():
+        try:
+            # Calculate size in MB
+            size_bytes = tensor.size * tensor.itemsize if hasattr(tensor, 'itemsize') else np.prod(tensor.shape) * 4  # Assume float32 if itemsize not available
+            size_mb = size_bytes / (1024 * 1024)
+            total_size_mb += size_mb
+            
+            # Get key as string for display
+            key_str = "/".join(key) if isinstance(key, tuple) else str(key)
+            tensor_sizes.append((key_str, size_mb, tensor.shape))
+        except (AttributeError, TypeError):
+            # Skip tensors that don't have shape or size attributes
+            continue
     
-    # If no index or empty list, search directly
-    if not result["safetensors"]:
-        result["safetensors"] = sorted(glob.glob(os.path.join(model_path, "model-*-of-*.safetensors")))
+    # Sort by size (largest first)
+    tensor_sizes.sort(key=lambda x: x[1], reverse=True)
     
-    # Check for config
-    config_file = os.path.join(model_path, "config.json")
-    if os.path.exists(config_file):
-        result["config"] = config_file
+    # Log the largest tensors
+    logger.info(f"Total parameter size: {total_size_mb:.2f} MB")
+    logger.info(f"Top {min(top_n, len(tensor_sizes))} largest tensors:")
+    for i, (key, size_mb, shape) in enumerate(tensor_sizes[:top_n]):
+        logger.info(f"  {i+1}. {key}: {size_mb:.2f} MB, shape={shape}")
     
-    # Check for tokenizer files
-    for tokenizer_file in ["tokenizer.json", "vocab.json", "merges.txt"]:
-        file_path = os.path.join(model_path, tokenizer_file)
-        if os.path.exists(file_path):
-            result["tokenizer_files"].append(file_path)
-    
-    # Log summary
-    logger.info(f"Found {len(result['safetensors'])} safetensors files")
-    logger.info(f"Found safetensors index: {result['safetensors_index'] is not None}")
-    logger.info(f"Found config file: {result['config'] is not None}")
-    logger.info(f"Found {len(result['tokenizer_files'])} tokenizer files")
-    
-    return result
+    return tensor_sizes[:top_n]
 
-
-def analyze_param_structure(params: Dict) -> Dict[str, Any]:
+def get_cached_weights(model_path, config, dtype):
     """
-    Analyze the parameter structure of loaded weights.
+    Get weights from cache if available, otherwise load them.
+    This prevents reloading the same weights multiple times.
     
     Args:
-        params: Parameter dictionary
+        model_path: Path to model weights
+        config: Model configuration
+        dtype: Data type to use
         
     Returns:
-        Dict with analysis results
+        Loaded weights
     """
-    # Handle different parameter structures - flatten appropriately
-    if isinstance(params, dict):
-        if "params" in params:
-            # This is a standard Flax params structure
-            flattened = flatten_dict(params)
-        else:
-            # This could be a raw weight dictionary from load_safetensors_weights
-            # Check if there are model-specific keys
-            if "model" in params:
-                # Extract model parameters
-                model_params = params["model"]
-                # Create custom flattened representation
-                flattened = {}
-                for key, value in flatten_dict(model_params).items():
-                    if isinstance(key, tuple):
-                        key_str = "/".join(key)
-                    else:
-                        key_str = key
-                    flattened[f"model/{key_str}"] = value
-                
-                # Add lm_head if present
-                if "lm_head" in params:
-                    for key, value in flatten_dict(params["lm_head"]).items():
-                        if isinstance(key, tuple):
-                            key_str = "/".join(key)
-                        else:
-                            key_str = key
-                        flattened[f"lm_head/{key_str}"] = value
-            else:
-                # Just flatten as is - likely raw weights
-                tmp_flat = {}
-                for key, value in flatten_dict(params).items():
-                    if isinstance(key, tuple):
-                        key_str = "/".join(key)
-                    else:
-                        key_str = key
-                    tmp_flat[key_str] = value
-                flattened = tmp_flat
+    cache_key = f"{model_path}_{dtype}"
+    if cache_key not in _weight_cache:
+        logger.info("Loading weights (not found in cache)...")
+        _weight_cache[cache_key] = load_safetensors_weights(model_path)
+        
+        # Log memory usage after loading
+        log_memory_usage("after loading weights")
     else:
-        # Not a dictionary - can't analyze
-        return {
-            "error": "Input is not a dictionary",
-            "status": "error",
-            "total_params": 0,
-            "num_tensors": 0
-        }
+        logger.info("Using cached weights")
     
-    total_params = 0
-    param_shapes = {}
-    param_types = {}
-    
-    # Define critical keys that must be present for a functional model
-    # For raw safetensors weights
-    critical_keys_raw = [
-        "model/embed_tokens/weight",
-        "lm_head/weight"
-    ]
-    
-    # For processed Flax model params
-    critical_keys_flax = [
-        "params/embed_tokens/embedding",
-        "params/lm_head/kernel"
-    ]
-    
-    # Check layer patterns
-    layer_pattern_counts = {}
-    
-    # Convert keys to strings for easier analysis if they're not already
-    key_strings = []
-    for k in flattened.keys():
-        if isinstance(k, tuple):
-            key_strings.append("/".join(k))
-        elif isinstance(k, str):
-            key_strings.append(k)
-        else:
-            key_strings.append(str(k))
-    
-    # Count parameters and analyze structure
-    for key, tensor in flattened.items():
-        # Count parameters
-        num_params = np.prod(tensor.shape)
-        total_params += num_params
-        
-        # Group by shape
-        shape_str = str(tensor.shape)
-        if shape_str not in param_shapes:
-            param_shapes[shape_str] = 0
-        param_shapes[shape_str] += 1
-        
-        # Group by tensor type
-        dtype_str = str(tensor.dtype)
-        if dtype_str not in param_types:
-            param_types[dtype_str] = 0
-        param_types[dtype_str] += 1
-        
-        # Check for layer patterns
-        key_str = key if isinstance(key, str) else "/".join(key) if isinstance(key, tuple) else str(key)
-        for pattern in ["attention", "mlp", "layernorm", "embed"]:
-            if pattern in key_str.lower():
-                if pattern not in layer_pattern_counts:
-                    layer_pattern_counts[pattern] = 0
-                layer_pattern_counts[pattern] += 1
-    
-    # Check for critical keys
-    critical_keys_found = []
-    
-    # Try both raw and Flax key formats
-    for critical_key in critical_keys_raw + critical_keys_flax:
-        found = False
-        for key in key_strings:
-            if critical_key in key:
-                found = True
-                critical_keys_found.append(critical_key)
-                break
-    
-    # Determine if we have different layers
-    num_layers = 0
-    for i in range(50):  # Check up to 50 layers
-        layer_found = False
-        for key in key_strings:
-            if f"layers/{i}/" in key or f"layers_{i}/" in key or f"layers.{i}." in key or f"layers.{i}/" in key:
-                layer_found = True
-                break
-        if layer_found:
-            num_layers = i + 1
-        else:
-            break
-    
-    return {
-        "total_params": total_params,
-        "num_tensors": len(flattened),
-        "param_shapes": param_shapes,
-        "param_types": param_types,
-        "critical_keys_present": len(critical_keys_found) > 0,  # At least one critical key format found
-        "critical_keys_found": critical_keys_found,
-        "layer_pattern_counts": layer_pattern_counts,
-        "num_layers_detected": num_layers,
-        "status": "ok" if len(critical_keys_found) > 0 and num_layers > 0 else "incomplete",
-        "sample_keys": key_strings[:10],  # First 10 keys for inspection
-    }
-
-
-def fix_params_structure(params):
-    """
-    Fix the parameter structure to ensure it's compatible with FlaxQwen25ForCausalLM.
-    
-    Args:
-        params: Parameter dictionary, potentially needing structure fixes
-        
-    Returns:
-        Properly structured parameter dictionary
-    """
-    from flax.core.frozen_dict import freeze, unfreeze
-    
-    # If params is already a FrozenDict, unfreeze it
-    if hasattr(params, 'unfreeze'):
-        params = params.unfreeze()
-    
-    # If params doesn't have a 'params' key, wrap it
-    if isinstance(params, dict) and 'params' not in params:
-        params = {'params': params}
-    
-    # Ensure the structure is correct
-    if 'params' in params:
-        # Correct structure for params - check needed keys
-        param_dict = params['params']
-        
-        # Check for embed_tokens structure
-        if 'embed_tokens' in param_dict and 'embedding' not in param_dict['embed_tokens']:
-            # Look for weight parameter
-            if 'weight' in param_dict['embed_tokens']:
-                param_dict['embed_tokens']['embedding'] = param_dict['embed_tokens']['weight']
-                del param_dict['embed_tokens']['weight']
-        
-        # Check for lm_head structure 
-        if 'lm_head' in param_dict and 'kernel' not in param_dict['lm_head'] and 'weight' in param_dict['lm_head']:
-            param_dict['lm_head']['kernel'] = param_dict['lm_head']['weight']
-            del param_dict['lm_head']['weight']
-        
-        # Check for layers structure
-        if 'layers' in param_dict:
-            # Ensure we have the norm parameter
-            if 'norm' not in param_dict['layers'] and 'ln_f' in param_dict:
-                param_dict['layers']['norm'] = param_dict['ln_f']
-                del param_dict['ln_f']
-                
-            # Check transformer layers
-            if 'layers' not in param_dict['layers'] and 'h' in param_dict:
-                # Handle h → layers.layers conversion
-                param_dict['layers']['layers'] = param_dict['h']
-                del param_dict['h']
-                
-            # Process each layer if layers.layers exists
-            if 'layers' in param_dict['layers']:
-                for layer_idx, layer in param_dict['layers']['layers'].items():
-                    # Convert attention structure
-                    if 'attn' in layer and 'attention' not in layer:
-                        layer['attention'] = layer['attn']
-                        del layer['attn']
-                        
-                    # Fix attention component keys
-                    if 'attention' in layer:
-                        attn = layer['attention']
-                        
-                        # Handle q/k/v/o projections
-                        for proj in ['q', 'k', 'v', 'o']:
-                            if proj in attn and f'{proj}_proj' not in attn:
-                                attn[f'{proj}_proj'] = attn[proj]
-                                del attn[proj]
-                                
-                            # Fix kernel/weight naming
-                            if f'{proj}_proj' in attn and 'kernel' not in attn[f'{proj}_proj'] and 'weight' in attn[f'{proj}_proj']:
-                                attn[f'{proj}_proj']['kernel'] = attn[f'{proj}_proj']['weight']
-                                del attn[f'{proj}_proj']['weight']
-                    
-                    # Fix layer norm naming
-                    if 'ln_1' in layer and 'input_layernorm' not in layer:
-                        layer['input_layernorm'] = layer['ln_1']
-                        del layer['ln_1']
-                        
-                    if 'ln_2' in layer and 'post_attention_layernorm' not in layer:
-                        layer['post_attention_layernorm'] = layer['ln_2']
-                        del layer['ln_2']
-                        
-                    # Fix layernorm scale/weight naming
-                    for norm_name in ['input_layernorm', 'post_attention_layernorm']:
-                        if norm_name in layer and 'scale' not in layer[norm_name] and 'weight' in layer[norm_name]:
-                            layer[norm_name]['scale'] = layer[norm_name]['weight']
-                            del layer[norm_name]['weight']
-                    
-                    # Fix MLP keys
-                    if 'mlp' in layer:
-                        mlp = layer['mlp']
-                        
-                        # Convert gate/up/down projection keys
-                        key_mapping = {
-                            'w1': 'gate_proj',
-                            'w2': 'up_proj',
-                            'w3': 'down_proj'
-                        }
-                        
-                        for old_key, new_key in key_mapping.items():
-                            if old_key in mlp and new_key not in mlp:
-                                mlp[new_key] = mlp[old_key]
-                                del mlp[old_key]
-                                
-                            # Fix kernel/weight naming
-                            if new_key in mlp and 'kernel' not in mlp[new_key] and 'weight' in mlp[new_key]:
-                                mlp[new_key]['kernel'] = mlp[new_key]['weight']
-                                del mlp[new_key]['weight']
-    
-    # Return properly frozen parameters
-    return freeze(params)
-
+    return _weight_cache[cache_key]
 
 def test_direct_safetensors(model_path: str, config: Qwen25Config, dtype: jnp.dtype = jnp.float32) -> Dict:
     """
@@ -412,13 +167,13 @@ def test_direct_safetensors(model_path: str, config: Qwen25Config, dtype: jnp.dt
     start_time = time.time()
     
     try:
-        params = load_safetensors_weights(model_path)
+        # Use cached weights if available
+        params = get_cached_weights(model_path, config, dtype)
         logger.info(f"Successfully loaded weights in {time.time() - start_time:.2f} seconds")
         return params
     except Exception as e:
         logger.error(f"Direct safetensors loading failed: {e}")
         return None
-
 
 def test_direct_load_from_index(model_path: str, config: Qwen25Config, dtype: jnp.dtype = jnp.float32) -> Dict:
     """
@@ -435,22 +190,55 @@ def test_direct_load_from_index(model_path: str, config: Qwen25Config, dtype: jn
     logger.info("Testing direct loading using index file...")
     start_time = time.time()
     
+    # Import necessary modules here to control cleanup
+    import gc
+    import jax
+    
     try:
-        # Create model instance
+        # Create model instance - with minimal initialization
+        logger.info("Creating base model instance...")
         model = FlaxQwen25ForCausalLM(config, dtype=dtype, _do_init=True)
         
+        # Clear any compilation caches before loading weights
+        jax.clear_caches()
+        gc.collect()
+        
         # Load weights using direct_load_from_index
+        logger.info("Loading weights from index file...")
         model_or_params = direct_load_from_index(model, model_path)
+        
+        # Clear memory from loading process
+        # Free some references that might hold memory
+        for key in list(globals().keys()):
+            if key.startswith('_jit_') or key.startswith('_tmp_'):
+                del globals()[key]
+        gc.collect()
+        jax.clear_caches()
         
         # Check if we got back a model or just parameters
         if hasattr(model_or_params, 'params'):
             # We got back a model
+            logger.info("Received model object with parameters already set")
             model = model_or_params
         else:
             # We got back parameters - need to fix structure and update model
             logger.info("Got parameters instead of model - fixing structure and updating model")
+            
+            # Process in steps to avoid holding too much in memory at once
+            logger.info("Fixing parameter structure...")
             params = fix_params_structure(model_or_params)
+            
+            # Clear references to old parameter structure
+            del model_or_params
+            gc.collect()
+            
+            # Update model parameters
+            logger.info("Updating model parameters...")
             model.params = params
+            
+            # Clear references
+            del params
+            gc.collect()
         
         logger.info(f"Successfully loaded weights in {time.time() - start_time:.2f} seconds")
         return model
@@ -458,8 +246,10 @@ def test_direct_load_from_index(model_path: str, config: Qwen25Config, dtype: jn
         logger.error(f"direct_load_from_index failed: {e}")
         import traceback
         traceback.print_exc()
+        # Make sure to collect garbage even if we failed
+        gc.collect()
+        jax.clear_caches()
         return None
-
 
 def test_model_and_weights(model_path: str, config: Qwen25Config, dtype: jnp.dtype = jnp.float32) -> Dict:
     """
@@ -489,7 +279,6 @@ def test_model_and_weights(model_path: str, config: Qwen25Config, dtype: jnp.dty
         logger.error(f"load_model_and_weights failed: {e}")
         return None
 
-
 def test_forward_pass(model, config: Qwen25Config, tokenizer=None) -> bool:
     """
     Test a simple forward pass with the loaded model.
@@ -512,41 +301,68 @@ def test_forward_pass(model, config: Qwen25Config, tokenizer=None) -> bool:
             from flax.traverse_util import flatten_dict
             flat_params = flatten_dict(model.params)
             
-            # Check that we have the essential parameters
-            essential_params = [
-                # Look for token embeddings
-                ('params', 'embed_tokens', 'embedding'),
-                # Look for LM head
-                ('params', 'lm_head', 'kernel'),
-                # Look for final layer norm 
-                ('params', 'layers', 'norm', 'scale'),
-                # Look for at least one transformer layer
-                ('params', 'layers', 'layers', '0')
+            # Log memory usage after flattening parameters
+            log_memory_usage("before parameter verification")
+            
+            # Check that we have the essential parameters - support both formats
+            # Either direct or with 'model' in the path
+            essential_param_patterns = [
+                # Format 1: Without 'model' in path
+                [
+                    ('params', 'embed_tokens', 'embedding'),
+                    ('params', 'lm_head', 'kernel'),
+                    ('params', 'layers', 'norm', 'scale')
+                ],
+                # Format 2: With 'model' in path
+                [
+                    ('params', 'model', 'embed_tokens', 'embedding'),
+                    ('params', 'lm_head', 'kernel'),
+                    ('params', 'model', 'layers', 'norm', 'scale')
+                ]
             ]
             
-            missing_params = []
-            for param_path in essential_params:
-                if param_path not in flat_params:
-                    missing_params.append('/'.join(param_path))
+            # For each parameter set, check if any are missing
+            format_found = False
+            for param_set in essential_param_patterns:
+                missing_params = []
+                for param_path in param_set:
+                    if param_path not in flat_params:
+                        missing_params.append('/'.join(param_path))
+                
+                # If all required params for this format exist, we found a match
+                if not missing_params:
+                    format_found = True
+                    break
             
-            if missing_params:
-                logger.error(f"Missing essential parameters: {missing_params}")
+            if not format_found:
+                logger.error(f"Missing essential parameters for all supported formats")
                 logger.info("Available top-level parameters:")
                 if 'params' in model.params:
                     logger.info(f"  params keys: {list(model.params['params'].keys())}")
+                    if 'model' in model.params['params']:
+                        logger.info(f"  model keys: {list(model.params['params']['model'].keys())}")
                     if 'layers' in model.params['params']:
                         logger.info(f"  layers keys: {list(model.params['params']['layers'].keys())}")
-                        if 'layers' in model.params['params']['layers']:
-                            logger.info(f"  layer indices: {list(model.params['params']['layers']['layers'].keys())}")
+                    elif 'model' in model.params['params'] and 'layers' in model.params['params']['model']:
+                        logger.info(f"  model/layers keys: {list(model.params['params']['model']['layers'].keys())}")
+                
+                # If no matching format, analyze largest tensors to help diagnose the issue
+                log_tensor_sizes(model.params)
                 return False
             
-            # Check parameter shapes for key components
-            # Embedding matrix should be [vocab_size, hidden_size]
-            if ('params', 'embed_tokens', 'embedding') in flat_params:
-                embed_shape = flat_params[('params', 'embed_tokens', 'embedding')].shape
-                expected_shape = (config.vocab_size, config.hidden_size)
-                if embed_shape != expected_shape:
-                    logger.warning(f"Embedding shape mismatch: got {embed_shape}, expected {expected_shape}")
+            # Check parameter shapes for key components - try both formats
+            embed_shapes = []
+            embed_paths = [
+                ('params', 'embed_tokens', 'embedding'),
+                ('params', 'model', 'embed_tokens', 'embedding')
+            ]
+            for path in embed_paths:
+                if path in flat_params:
+                    embed_shape = flat_params[path].shape
+                    expected_shape = (config.vocab_size, config.hidden_size)
+                    if embed_shape != expected_shape:
+                        logger.warning(f"Embedding shape mismatch at {path}: got {embed_shape}, expected {expected_shape}")
+                    embed_shapes.append(embed_shape)
             
             # LM head should be [hidden_size, vocab_size] in Flax (transposed from PyTorch)
             if ('params', 'lm_head', 'kernel') in flat_params:
@@ -640,7 +456,6 @@ def test_forward_pass(model, config: Qwen25Config, tokenizer=None) -> bool:
         logger.error(traceback.format_exc())
         return False
 
-
 def verify_parameter_mapping(model_params: Dict) -> Dict[str, bool]:
     """
     Verify that parameters are correctly mapped to the model structure.
@@ -708,205 +523,616 @@ def verify_parameter_mapping(model_params: Dict) -> Dict[str, bool]:
     
     return result
 
+def scan_checkpoint_files(model_path: str) -> Dict[str, Any]:
+    """
+    Scan the checkpoint directory and return information about available files.
+    
+    Args:
+        model_path: Path to the model directory
+        
+    Returns:
+        Dict containing information about available files
+    """
+    import glob
+    
+    result = {
+        "safetensors": [],
+        "safetensors_index": None,
+        "config": None,
+        "tokenizer_files": []
+    }
+    
+    # Check for safetensors index
+    index_file = os.path.join(model_path, "model.safetensors.index.json")
+    if os.path.exists(index_file):
+        result["safetensors_index"] = index_file
+        
+        # Read index to get files
+        with open(index_file, "r") as f:
+            index = json.load(f)
+            if "weight_map" in index:
+                weight_map = index["weight_map"]
+                files = sorted(list(set(weight_map.values())))
+                result["safetensors"] = [os.path.join(model_path, f) for f in files]
+    
+    # If no index or empty list, search directly
+    if not result["safetensors"]:
+        result["safetensors"] = sorted(glob.glob(os.path.join(model_path, "model-*-of-*.safetensors")))
+    
+    # Check for config
+    config_file = os.path.join(model_path, "config.json")
+    if os.path.exists(config_file):
+        result["config"] = config_file
+    
+    # Check for tokenizer files
+    for tokenizer_file in ["tokenizer.json", "vocab.json", "merges.txt"]:
+        file_path = os.path.join(model_path, tokenizer_file)
+        if os.path.exists(file_path):
+            result["tokenizer_files"].append(file_path)
+    
+    # Log summary
+    logger.info(f"Found {len(result['safetensors'])} safetensors files")
+    logger.info(f"Found safetensors index: {result['safetensors_index'] is not None}")
+    logger.info(f"Found config file: {result['config'] is not None}")
+    logger.info(f"Found {len(result['tokenizer_files'])} tokenizer files")
+    
+    return result
+
+def analyze_param_structure(params: Dict) -> Dict[str, Any]:
+    """
+    Analyze the parameter structure of loaded weights.
+    
+    Args:
+        params: Parameter dictionary
+        
+    Returns:
+        Dict with analysis results
+    """
+    total_params = 0
+    num_tensors = 0
+    param_shapes = {}
+    param_types = {}
+    layer_pattern_counts = {}
+    
+    # Define critical keys that must be present for a functional model
+    # For raw safetensors weights
+    critical_keys_raw = [
+        "model/embed_tokens/weight",
+        "lm_head/weight"
+    ]
+    
+    # For processed Flax model params
+    critical_keys_flax = [
+        "params/embed_tokens/embedding",
+        "params/lm_head/kernel",
+        # Also check for 'model' in the path
+        "params/model/embed_tokens/embedding",
+        "params/model/lm_head/kernel"
+    ]
+    
+    # Keep track of key strings for checking critical keys and layers
+    critical_keys_found = []
+    
+    # Use a generator for keys to avoid storing all of them in memory at once
+    def get_key_strings(params):
+        """Generate key strings efficiently without storing them all at once."""
+        # Handle different parameter structures - flatten appropriately
+        if isinstance(params, dict):
+            if "params" in params:
+                # This is a standard Flax params structure
+                for key, value in flatten_dict(params).items():
+                    yield key, value
+            else:
+                # This could be a raw weight dictionary from load_safetensors_weights
+                # Check if there are model-specific keys
+                if "model" in params:
+                    # Extract model parameters
+                    model_params = params["model"]
+                    # Create custom flattened representation
+                    for key, value in flatten_dict(model_params).items():
+                        key_str = "model/" + ("/".join(key) if isinstance(key, tuple) else key)
+                        yield key_str, value
+                    
+                    # Add lm_head if present
+                    if "lm_head" in params:
+                        for key, value in flatten_dict(params["lm_head"]).items():
+                            key_str = "lm_head/" + ("/".join(key) if isinstance(key, tuple) else key)
+                            yield key_str, value
+                else:
+                    # Just flatten as is - likely raw weights
+                    for key, value in flatten_dict(params).items():
+                        key_str = "/".join(key) if isinstance(key, tuple) else key
+                        yield key_str, value
+    
+    # Analyze layers to find maximum layer index
+    num_layers = 0
+    
+    # Process all keys using the generator
+    key_count = 0
+    for key_str, tensor in get_key_strings(params):
+        # Convert tuple keys to strings for consistency
+        if isinstance(key_str, tuple):
+            key_str = "/".join(key_str)
+        
+        # Count parameters
+        try:
+            num_params = np.prod(tensor.shape)
+            total_params += num_params
+            num_tensors += 1
+            
+            # Group by shape
+            shape_str = str(tensor.shape)
+            if shape_str not in param_shapes:
+                param_shapes[shape_str] = 0
+            param_shapes[shape_str] += 1
+            
+            # Group by tensor type
+            dtype_str = str(tensor.dtype)
+            if dtype_str not in param_types:
+                param_types[dtype_str] = 0
+            param_types[dtype_str] += 1
+            
+            # Check for layer patterns
+            for pattern in ["attention", "mlp", "layernorm", "embed"]:
+                if pattern in key_str.lower():
+                    if pattern not in layer_pattern_counts:
+                        layer_pattern_counts[pattern] = 0
+                    layer_pattern_counts[pattern] += 1
+            
+            # Check for critical keys
+            for critical_key in critical_keys_raw + critical_keys_flax:
+                if critical_key in key_str and critical_key not in critical_keys_found:
+                    critical_keys_found.append(critical_key)
+            
+            # Check for layer indices
+            for pattern in [r"layers/(\d+)/", r"layers_(\d+)/", r"layers\.(\d+)\.", r"layers\.(\d+)/", r"layers/layers_(\d+)/"]:
+                import re
+                match = re.search(pattern, key_str)
+                if match:
+                    layer_idx = int(match.group(1))
+                    num_layers = max(num_layers, layer_idx + 1)
+                    break
+            
+            # Increment key count
+            key_count += 1
+            
+            # Periodically log progress for large parameter sets
+            if key_count % 100 == 0:
+                logger.debug(f"Analyzed {key_count} parameters...")
+        except Exception as e:
+            # Skip parameters that can't be analyzed
+            logger.debug(f"Error analyzing parameter: {e}")
+            continue
+    
+    # We only need to collect a limited number of sample keys for display
+    sample_keys = []
+    for i, (key_str, _) in enumerate(get_key_strings(params)):
+        if i >= 10:  # Only collect 10 keys
+            break
+        if isinstance(key_str, tuple):
+            key_str = "/".join(key_str)
+        sample_keys.append(key_str)
+    
+    return {
+        "total_params": total_params,
+        "num_tensors": num_tensors,
+        "param_shapes": param_shapes,
+        "param_types": param_types,
+        "critical_keys_present": len(critical_keys_found) > 0,  # At least one critical key format found
+        "critical_keys_found": critical_keys_found,
+        "layer_pattern_counts": layer_pattern_counts,
+        "num_layers_detected": num_layers,
+        "status": "ok" if len(critical_keys_found) > 0 and num_layers > 0 else "incomplete",
+        "sample_keys": sample_keys,  # First 10 keys for inspection
+    }
+
+def fix_params_structure(weights):
+    """
+    Fix parameter structure to match FlaxQwen25ForCausalLM expectations.
+    
+    Args:
+        weights: Dictionary of weights loaded from safetensors
+        
+    Returns:
+        Dictionary with restructured weights matching Flax model structure
+    """
+    logger.info("Restructuring parameters to match FlaxQwen25ForCausalLM")
+    
+    # Initialize the restructured parameters dict
+    fixed_params = {"params": {}}
+    
+    # Extract configuration parameters from weights to determine model structure
+    config = {}
+    if "model.embed_tokens.weight" in weights:
+        vocab_size = weights["model.embed_tokens.weight"].shape[0]
+        hidden_size = weights["model.embed_tokens.weight"].shape[1]
+        config["vocab_size"] = vocab_size
+        config["hidden_size"] = hidden_size
+    
+    # Count number of layers based on pattern matching
+    layer_count = 0
+    for key in weights:
+        if "model.layers." in key:
+            layer_num = int(key.split("model.layers.")[1].split(".")[0])
+            layer_count = max(layer_count, layer_num + 1)
+    
+    logger.info(f"Detected model structure: vocab_size={config.get('vocab_size', 'unknown')}, "
+                f"hidden_size={config.get('hidden_size', 'unknown')}, layers={layer_count}")
+    
+    # Mapping from PyTorch parameter names to Flax parameter structure
+    mappings = {
+        # Embeddings
+        "model.embed_tokens.weight": ("model", "embed_tokens", "embedding"),
+        
+        # Layer mappings (will be formatted with layer number)
+        "model.layers.{}.self_attn.q_proj.weight": ("model", "layers_{}", "self_attn", "q_proj", "kernel"),
+        "model.layers.{}.self_attn.k_proj.weight": ("model", "layers_{}", "self_attn", "k_proj", "kernel"),
+        "model.layers.{}.self_attn.v_proj.weight": ("model", "layers_{}", "self_attn", "v_proj", "kernel"),
+        "model.layers.{}.self_attn.o_proj.weight": ("model", "layers_{}", "self_attn", "o_proj", "kernel"),
+        
+        "model.layers.{}.mlp.gate_proj.weight": ("model", "layers_{}", "mlp", "gate_proj", "kernel"),
+        "model.layers.{}.mlp.up_proj.weight": ("model", "layers_{}", "mlp", "up_proj", "kernel"),
+        "model.layers.{}.mlp.down_proj.weight": ("model", "layers_{}", "mlp", "down_proj", "kernel"),
+        
+        "model.layers.{}.input_layernorm.weight": ("model", "layers_{}", "input_layernorm", "scale"),
+        "model.layers.{}.post_attention_layernorm.weight": ("model", "layers_{}", "post_attention_layernorm", "scale"),
+        
+        # Final layer norm
+        "model.norm.weight": ("model", "norm", "scale"),
+        
+        # Language model head
+        "lm_head.weight": ("lm_head", "kernel"),
+    }
+    
+    # Process every weight from the source dictionary
+    processed_keys = set()
+    
+    # First, handle the layer-specific weights
+    for layer_idx in range(layer_count):
+        for src_pattern, dst_path in mappings.items():
+            if "{}" in src_pattern:
+                src_key = src_pattern.format(layer_idx)
+                if src_key in weights:
+                    # Create path in the params dictionary
+                    current = fixed_params["params"]
+                    for part in dst_path[:-1]:
+                        part_name = part.format(layer_idx) if "{}" in part else part
+                        if part_name not in current:
+                            current[part_name] = {}
+                        current = current[part_name]
+                    
+                    # Add the weight tensor, handling necessary transformations
+                    last_part = dst_path[-1].format(layer_idx) if "{}" in dst_path[-1] else dst_path[-1]
+                    
+                    # Special handling for weight matrices - transpose kernel matrices for Flax
+                    if last_part == "kernel":
+                        current[last_part] = weights[src_key].T  # Transpose for Flax
+                    else:
+                        current[last_part] = weights[src_key]
+                    
+                    processed_keys.add(src_key)
+    
+    # Handle non-layer specific weights
+    for src_key, dst_path in mappings.items():
+        if "{}" not in src_key and src_key in weights:
+            # Create path in the params dictionary
+            current = fixed_params["params"]
+            for part in dst_path[:-1]:
+                if part not in current:
+                    current[part] = {}
+                current = current[part]
+            
+            # Add the weight tensor, handling necessary transformations
+            last_part = dst_path[-1]
+            
+            # Special handling for weight matrices - transpose kernel matrices for Flax
+            if last_part == "kernel":
+                current[last_part] = weights[src_key].T  # Transpose for Flax
+            elif last_part == "embedding":
+                current[last_part] = weights[src_key]  # Don't transpose embeddings
+            else:
+                current[last_part] = weights[src_key]
+            
+            processed_keys.add(src_key)
+    
+    # Log stats about the conversion
+    total_keys = len(weights)
+    logger.info(f"Processed {len(processed_keys)}/{total_keys} weights for FlaxQwen25ForCausalLM structure")
+    
+    if len(processed_keys) < total_keys:
+        # Log a sample of unprocessed keys for debugging
+        unprocessed = set(weights.keys()) - processed_keys
+        logger.warning(f"Unable to map {len(unprocessed)} keys, first 10: {list(unprocessed)[:10]}")
+    
+    return fixed_params
+
+def log_memory_usage(label=""):
+    """Log the current memory usage."""
+    try:
+        import psutil
+        import os
+        process = psutil.Process(os.getpid())
+        memory_info = process.memory_info()
+        rss_gb = memory_info.rss / (1024 ** 3)
+        vms_gb = memory_info.vms / (1024 ** 3)
+        logger.info(f"Memory Usage {label}: RSS={rss_gb:.2f} GB, VMS={vms_gb:.2f} GB")
+        return rss_gb
+    except Exception as e:
+        logger.warning(f"Failed to log memory usage: {e}")
+        return None
+
+def load_safetensors_weights(model_path, slice_size=None, verbose=True):
+    """
+    Load weights from a safetensors file incrementally to reduce memory usage.
+    
+    Args:
+        model_path: Path to the model directory or specific safetensors file
+        slice_size: Optional slice size to load incrementally
+        verbose: Whether to log detailed information
+        
+    Returns:
+        Dict with loaded weights
+    """
+    import gc
+    from safetensors import safe_open
+    from safetensors.flax import load_file
+
+    log_memory_usage("Before loading weights")
+    
+    # Scan checkpoint files
+    ckpt_info = scan_checkpoint_files(model_path)
+    safetensors_files = ckpt_info["safetensors"]
+    
+    if not safetensors_files:
+        logger.error(f"No safetensors files found in {model_path}")
+        return None
+    
+    # Initialize dictionary to accumulate weights from all files
+    all_weights = {}
+    num_total_tensors = 0
+    
+    # Load index file if available to get metadata
+    index_file = ckpt_info["safetensors_index"]
+    weight_map = {}
+    
+    if index_file:
+        with open(index_file, "r") as f:
+            index_data = json.load(f)
+            weight_map = index_data.get("weight_map", {})
+            if "metadata" in index_data:
+                logger.info(f"Model metadata: {index_data['metadata']}")
+    
+    # Function to get all keys from a safetensors file without loading tensors
+    def get_keys_from_file(file_path):
+        keys = []
+        with safe_open(file_path, framework="flax") as f:
+            keys = f.keys()
+        return keys
+    
+    # Scan files first to get total tensor count for progress reporting
+    file_keys_map = {}
+    for file_path in safetensors_files:
+        keys = get_keys_from_file(file_path)
+        file_keys_map[file_path] = keys
+        num_total_tensors += len(keys)
+    
+    logger.info(f"Found {num_total_tensors} tensors across {len(safetensors_files)} files")
+    
+    # Process files incrementally
+    tensors_processed = 0
+    for file_idx, file_path in enumerate(safetensors_files):
+        file_keys = file_keys_map[file_path]
+        logger.info(f"Processing file {file_idx+1}/{len(safetensors_files)}: {os.path.basename(file_path)} with {len(file_keys)} tensors")
+        
+        # Batch loading if slice_size specified, otherwise load the whole file at once
+        if slice_size and len(file_keys) > slice_size:
+            # Process in batches
+            current_weights = {}
+            key_batches = [file_keys[i:i+slice_size] for i in range(0, len(file_keys), slice_size)]
+            
+            for batch_idx, key_batch in enumerate(key_batches):
+                logger.info(f"Loading batch {batch_idx+1}/{len(key_batches)} with {len(key_batch)} tensors")
+                
+                # Load only specific keys in this batch
+                with safe_open(file_path, framework="flax") as f:
+                    batch_start = time.time()
+                    for key in key_batch:
+                        current_weights[key] = f.get_tensor(key)
+                        tensors_processed += 1
+                        
+                        # Log progress periodically
+                        if tensors_processed % 50 == 0:
+                            progress_pct = (tensors_processed / num_total_tensors) * 100
+                            logger.info(f"Loaded {tensors_processed}/{num_total_tensors} tensors ({progress_pct:.1f}%)")
+                    
+                    batch_time = time.time() - batch_start
+                    logger.info(f"Batch loaded in {batch_time:.2f}s")
+                
+                # Merge batch into full weights and clear batch memory
+                all_weights.update(current_weights)
+                current_weights.clear()
+                
+                # Force garbage collection
+                gc.collect()
+                log_memory_usage(f"After batch {batch_idx+1}")
+        else:
+            # Load the whole file at once for smaller files
+            start_time = time.time()
+            current_weights = load_file(file_path)
+            tensors_processed += len(current_weights)
+            load_time = time.time() - start_time
+            logger.info(f"File loaded in {load_time:.2f}s")
+            
+            # Merge this file's weights into the full set
+            all_weights.update(current_weights)
+            
+            # Clear references to free memory
+            current_weights.clear()
+            
+            # Force garbage collection
+            gc.collect()
+            log_memory_usage(f"After file {file_idx+1}")
+    
+    # Log final stats
+    log_memory_usage("After loading all weights")
+    logger.info(f"Loaded {len(all_weights)} weights total from {len(safetensors_files)} files")
+    
+    # Analyze the loaded weights
+    if verbose:
+        analysis = analyze_param_structure(all_weights)
+        logger.info(f"Params analysis: {analysis['total_params']/1e9:.2f}B params, {analysis['num_tensors']} tensors")
+        logger.info(f"Critical keys present: {analysis['critical_keys_present']}")
+        logger.info(f"Detected layers: {analysis['num_layers_detected']}")
+        logger.info(f"Parameter status: {analysis['status']}")
+    
+    # Clean up memory one more time before returning
+    gc.collect()
+    
+    return all_weights
+
+def load_weights_with_slices(checkpoint_files, slice_size=1000):
+    """
+    Load model weights from checkpoint files in slices to minimize memory usage.
+    
+    Args:
+        checkpoint_files: List of safetensors file paths
+        slice_size: Number of parameters to load at once
+        
+    Returns:
+        Dictionary with all model weights
+    """
+    logger.info(f"Loading weights from {len(checkpoint_files)} checkpoint files using slice size {slice_size}")
+    
+    # First scan to get metadata for all tensors
+    all_tensors_info = {}
+    total_params = 0
+    
+    for checkpoint_file in checkpoint_files:
+        with safe_open(checkpoint_file, framework="jax") as f:
+            metadata = f.metadata()
+            tensor_names = f.keys()
+            
+            for name in tensor_names:
+                if name not in all_tensors_info:  # Prevent duplicates
+                    tensor_info = metadata.get(name, {})
+                    shape = f.get_tensor_shape(name)
+                    dtype = f.get_tensor_dtype(name)
+                    all_tensors_info[name] = {"file": checkpoint_file, "shape": shape, "dtype": dtype}
+                    total_params += np.prod(shape)
+    
+    logger.info(f"Found {len(all_tensors_info)} tensors with a total of {total_params:,} parameters")
+    
+    # Group tensor names into slices to load
+    tensor_slices = []
+    current_slice = []
+    current_slice_params = 0
+    
+    for name, info in all_tensors_info.items():
+        param_count = np.prod(info["shape"])
+        
+        # If this tensor would exceed the slice size, start a new slice
+        # unless the current slice is empty (for very large tensors)
+        if current_slice_params + param_count > slice_size * 1e6 and current_slice:
+            tensor_slices.append(current_slice)
+            current_slice = [name]
+            current_slice_params = param_count
+        else:
+            current_slice.append(name)
+            current_slice_params += param_count
+    
+    # Add the last slice if not empty
+    if current_slice:
+        tensor_slices.append(current_slice)
+    
+    logger.info(f"Created {len(tensor_slices)} slices for loading")
+    
+    # Load tensor slices and combine into a single dictionary
+    weights = {}
+    
+    for i, slice_names in enumerate(tensor_slices):
+        logger.info(f"Loading slice {i+1}/{len(tensor_slices)} with {len(slice_names)} tensors")
+        slice_weights = {}
+        
+        # Group by file to minimize file open/close operations
+        file_groups = {}
+        for name in slice_names:
+            file_path = all_tensors_info[name]["file"]
+            if file_path not in file_groups:
+                file_groups[file_path] = []
+            file_groups[file_path].append(name)
+        
+        # Load from each file for this slice
+        for file_path, names in file_groups.items():
+            with safe_open(file_path, framework="jax") as f:
+                for name in names:
+                    tensor = f.get_tensor(name)
+                    slice_weights[name] = tensor
+        
+        # Add to our accumulated weights
+        weights.update(slice_weights)
+        
+        # Force garbage collection to free memory
+        slice_weights = None
+        import gc
+        gc.collect()
+    
+    logger.info(f"Successfully loaded all weights with {len(weights)} tensors")
+    return weights
 
 def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser(description="Test Qwen2.5 weight loading for full implementation")
-    parser.add_argument("--weights_dir", type=str, default="qwen25-weights",
-                        help="Path to model weights directory")
-    parser.add_argument("--use_bf16", action="store_true", 
-                        help="Use bfloat16 precision instead of float32")
-    parser.add_argument("--tokenizer_only", action="store_true",
-                        help="Only test tokenizer loading")
-    parser.add_argument("--test_forward", action="store_true",
-                        help="Test forward pass after loading")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Enable verbose logging")
-    parser.add_argument("--method", type=str, choices=["direct", "index", "full", "all"],
-                        default="direct", help="Which loading method to test")
+    parser = argparse.ArgumentParser(description="Load and convert Qwen 2.5 PyTorch weights to Flax format")
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        required=True,
+        help="Directory containing the PyTorch safetensors checkpoint files",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        required=True,
+        help="Directory to save the converted Flax model weights",
+    )
+    parser.add_argument(
+        "--slice_size",
+        type=int,
+        default=1000,
+        help="Size of parameter slices to load at once (in millions of parameters)",
+    )
     args = parser.parse_args()
+
+    # Setup logging
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        level=logging.INFO,
+    )
+
+    # Find checkpoint files
+    checkpoint_files = sorted(glob.glob(os.path.join(args.checkpoint_dir, "*.safetensors")))
+    if not checkpoint_files:
+        raise ValueError(f"No safetensors files found in {args.checkpoint_dir}")
     
-    # Set verbose logging if requested
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
+    logger.info(f"Found {len(checkpoint_files)} checkpoint files")
     
-    # Set data type based on arguments
-    dtype = jnp.bfloat16 if args.use_bf16 else jnp.float32
-    logger.info(f"Using precision: {dtype}")
+    # Load weights with memory-efficient slicing
+    torch_weights = load_weights_with_slices(checkpoint_files, slice_size=args.slice_size)
     
-    # Log system info
-    logger.info(f"JAX version: {jax.__version__}")
-    logger.info(f"Available devices: {jax.devices()}")
+    # Convert weights to Flax format
+    logger.info("Converting weights to Flax format...")
+    flax_params = fix_params_structure(torch_weights)
     
-    # Setup memory monitoring
-    import psutil
-    import gc
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
     
-    def log_memory_usage(stage):
-        """Log current memory usage."""
-        process = psutil.Process(os.getpid())
-        memory_info = process.memory_info()
-        memory_mb = memory_info.rss / (1024 * 1024)
-        total_memory = psutil.virtual_memory().total / (1024 * 1024)
-        logger.info(f"Memory usage at {stage}: {memory_mb:.2f} MB ({memory_mb/total_memory*100:.2f}% of system RAM)")
-        return memory_mb
+    # Save the converted weights
+    logger.info(f"Saving converted weights to {args.output_dir}")
+    with open(os.path.join(args.output_dir, "model.msgpack"), "wb") as f:
+        f.write(msgpack.dumps(flax_params))
     
-    def run_gc():
-        """Run garbage collection and log memory change."""
-        before = log_memory_usage("before GC")
-        gc.collect()
-        after = log_memory_usage("after GC")
-        logger.info(f"Memory freed by GC: {before - after:.2f} MB")
-    
-    # Log initial memory usage
-    initial_memory = log_memory_usage("start")
-    
-    # Check if weight directory exists
-    weights_dir = args.weights_dir
-    if not os.path.exists(weights_dir):
-        logger.error(f"Weights directory {weights_dir} does not exist")
-        return 1
-    
-    # Scan checkpoint files
-    files_info = scan_checkpoint_files(weights_dir)
-    
-    # Check if we have necessary files
-    if not files_info["safetensors"]:
-        logger.error("No safetensors files found")
-        return 1
-    
-    if not files_info["config"]:
-        logger.error("No config.json found")
-        return 1
-    
-    # Load config
-    try:
-        config = load_config_from_json(files_info["config"])
-        logger.info(f"Loaded config: hidden_size={config.hidden_size}, layers={config.num_hidden_layers}")
-    except Exception as e:
-        logger.error(f"Failed to load config: {e}")
-        return 1
-    
-    # Try to load tokenizer if requested
-    tokenizer = None
-    if args.test_forward or args.tokenizer_only:
-        try:
-            logger.info(f"Loading tokenizer from {weights_dir}")
-            tokenizer = AutoTokenizer.from_pretrained(weights_dir)
-            logger.info(f"Loaded tokenizer with vocab size {len(tokenizer)}")
-            
-            # Test tokenizer
-            sample_text = "Hello, world!"
-            encoded = tokenizer(sample_text, return_tensors="jax")
-            logger.info(f"Tokenizer test successful: {sample_text} -> {encoded.input_ids[0][:5]}...")
-            
-            if args.tokenizer_only:
-                logger.info("Tokenizer test completed successfully")
-                return 0
-        except Exception as e:
-            logger.error(f"Failed to load tokenizer: {e}")
-            if args.tokenizer_only:
-                return 1
-    
-    # Track success
-    success = False
-    
-    # Test specific loading method based on command line argument
-    if args.method in ["direct", "all"]:
-        logger.info("\n" + "="*50)
-        logger.info("TESTING DIRECT SAFETENSORS LOADING")
-        logger.info("="*50)
-        
-        # Method 1: Direct safetensors loading
-        params_direct = test_direct_safetensors(weights_dir, config, dtype)
-        if params_direct is not None:
-            # Analyze parameters
-            analysis = analyze_param_structure(params_direct)
-            logger.info(f"Direct loading analysis: Total params={analysis['total_params']:,}, Tensors={analysis['num_tensors']}")
-            if analysis["critical_keys_present"]:
-                logger.info("✅ Critical keys present in direct loading")
-                success = True
-            else:
-                logger.warning("⚠️ Missing critical keys in direct loading")
-                
-            # Log some sample keys for debugging
-            logger.info(f"Sample keys: {analysis['sample_keys']}")
-            
-            # Clean up to save memory
-            del params_direct
-            run_gc()
-    
-    if args.method in ["index", "all"]:
-        logger.info("\n" + "="*50)
-        logger.info("TESTING DIRECT LOAD FROM INDEX")
-        logger.info("="*50)
-        
-        # Method 2: direct_load_from_index
-        model_direct = test_direct_load_from_index(weights_dir, config, dtype)
-        if model_direct is not None:
-            # Analyze parameters
-            analysis = analyze_param_structure(model_direct.params)
-            logger.info(f"direct_load_from_index analysis: Total params={analysis['total_params']:,}, Tensors={analysis['num_tensors']}")
-            if analysis["critical_keys_present"]:
-                logger.info("✅ Critical keys present in direct_load_from_index")
-                success = True
-                
-                # Verify parameter mapping
-                mapping_result = verify_parameter_mapping(model_direct.params)
-                if mapping_result["all_components_present"]:
-                    logger.info(f"✅ All components present in parameter mapping (layers: {mapping_result['layer_count']})")
-                else:
-                    logger.warning(f"⚠️ Missing components in parameter mapping: {[k for k, v in mapping_result.items() if not v and k != 'all_components_present' and k != 'layer_count']}")
-                
-                # Test forward pass if requested
-                if args.test_forward:
-                    forward_success = test_forward_pass(model_direct, config, tokenizer)
-                    if forward_success:
-                        logger.info("✅ Forward pass with direct_load_from_index succeeded")
-                    else:
-                        logger.error("❌ Forward pass with direct_load_from_index failed")
-            else:
-                logger.warning("⚠️ Missing critical keys in direct_load_from_index")
-                
-            # Clean up to save memory
-            del model_direct
-            run_gc()
-    
-    if args.method in ["full", "all"]:
-        logger.info("\n" + "="*50)
-        logger.info("TESTING LOAD MODEL AND WEIGHTS")
-        logger.info("="*50)
-        
-        # Method 3: load_model_and_weights
-        model_full = test_model_and_weights(weights_dir, config, dtype)
-        if model_full is not None:
-            logger.info("✅ load_model_and_weights succeeded")
-            success = True
-            
-            # Test forward pass if requested
-            if args.test_forward:
-                forward_success = test_forward_pass(model_full, config, tokenizer)
-                if forward_success:
-                    logger.info("✅ Forward pass with load_model_and_weights succeeded")
-                else:
-                    logger.error("❌ Forward pass with load_model_and_weights failed")
-            
-            # Clean up to save memory
-            del model_full
-            run_gc()
-    
-    # Final memory usage
-    final_memory = log_memory_usage("end")
-    logger.info(f"Total memory change: {final_memory - initial_memory:.2f} MB")
-    
-    # Final status
-    if success:
-        logger.info("🎉 Weight loading test succeeded!")
-        return 0
-    else:
-        logger.error("❌ Weight loading test failed")
-        return 1
+    logger.info("Conversion complete!")
 
 
 if __name__ == "__main__":
-    sys.exit(main()) 
+    main() 

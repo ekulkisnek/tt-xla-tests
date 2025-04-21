@@ -1810,176 +1810,65 @@ class TensorParallelQwen2ForCausalLM(nn.Module):
         )
 
 def verify_parameter_structure(params, config):
-    """Verify the parameters have the expected structure."""
-    flat_params = flatten_dict(params, sep='/')
-    
-    # Flatten for easier inspection
-    first_param_layer = params['model']['layers_0'] if 'model' in params and 'layers_0' in params['model'] else None
-    
-    has_self_attn = first_param_layer is not None and 'self_attn' in first_param_layer
-    has_input_layernorm = first_param_layer is not None and 'input_layernorm' in first_param_layer
-    has_mlp = first_param_layer is not None and 'mlp' in first_param_layer
-    
-    # Verify basic structure
-    if 'model' not in params:
-        logger.warning("Parameter structure is missing 'model' key")
-    
-    if 'lm_head' not in params:
-        logger.warning("Parameter structure is missing 'lm_head' key")
-    
-    # Check if we have standard transformer blocks in the first layer
-    if not has_self_attn:
-        logger.warning("First layer missing self-attention module")
-    
-    if not has_input_layernorm:
-        logger.warning("First layer missing input layernorm")
-    
-    if not has_mlp:
-        logger.warning("First layer missing MLP module")
-    
-    # Check embedding
-    has_embed_tokens = 'embed_tokens' in params['model'] if 'model' in params else False
-    if not has_embed_tokens:
-        logger.warning("Parameter structure is missing embedding tokens")
-    
-    # Check attention parameters
-    if has_self_attn:
-        attn_params = first_param_layer['self_attn']
-        expected_attn_keys = ['q_proj', 'k_proj', 'v_proj', 'o_proj']
-        missing_attn_keys = [k for k in expected_attn_keys if k not in attn_params]
-        if missing_attn_keys:
-            logger.warning(f"Attention module missing keys: {missing_attn_keys}")
-    
-    # Log detection status
-    logger.info(f"Parameter structure verification: "
-                f"embed_tokens: {'✓' if has_embed_tokens else '✗'}, "
-                f"self_attn: {'✓' if has_self_attn else '✗'}, "
-                f"layernorm: {'✓' if has_input_layernorm else '✗'}, "
-                f"mlp: {'✓' if has_mlp else '✗'}")
-    
-    return True
-
-def map_parameter_paths(params):
     """
-    Map parameters between different naming conventions for better compatibility.
-    This helps translate between the expected parameter paths during loading and inference.
+    Verify that loaded parameters match the expected structure.
     
     Args:
-        params: Original parameter dictionary
+        params: Parameter dictionary
+        config: Model configuration
         
     Returns:
-        Mapped parameter dictionary with both path formats
+        Tuple of (is_valid, missing_params)
     """
-    logger.info("Mapping parameter paths to ensure compatibility...")
-    flat_params = flatten_dict(params)
-    mapped_params = {}
+    is_valid = True
+    missing_params = []
     
-    # Define mapping rules for common parameter path mismatches
-    mappings = [
-        # Format: (source_pattern, target_pattern)
-        (("params", "model", "embed_tokens", "weight"), 
-         ("params", "transformer", "embed_tokens", "QwenEmbed_0", "weight")),
-        
-        # Attention module mappings
-        (("params", "model", "layers_0", "self_attn", "q_proj", "kernel"), 
-         ("params", "transformer", "layers_0", "self_attn", "q_proj", "kernel")),
-        (("params", "model", "layers_0", "self_attn", "k_proj", "kernel"), 
-         ("params", "transformer", "layers_0", "self_attn", "k_proj", "kernel")),
-        (("params", "model", "layers_0", "self_attn", "v_proj", "kernel"), 
-         ("params", "transformer", "layers_0", "self_attn", "v_proj", "kernel")),
-        (("params", "model", "layers_0", "self_attn", "o_proj", "kernel"), 
-         ("params", "transformer", "layers_0", "self_attn", "o_proj", "kernel")),
-        
-        # MLP module mappings
-        (("params", "model", "layers_0", "mlp", "gate_proj", "kernel"), 
-         ("params", "transformer", "layers_0", "mlp", "gate_proj", "kernel")),
-        (("params", "model", "layers_0", "mlp", "up_proj", "kernel"), 
-         ("params", "transformer", "layers_0", "mlp", "up_proj", "kernel")),
-        (("params", "model", "layers_0", "mlp", "down_proj", "kernel"), 
-         ("params", "transformer", "layers_0", "mlp", "down_proj", "kernel")),
-        
-        # Layer norm mappings
-        (("params", "model", "layers_0", "input_layernorm", "weight"), 
-         ("params", "transformer", "layers_0", "input_layernorm", "weight")),
-        (("params", "model", "layers_0", "post_attention_layernorm", "weight"), 
-         ("params", "transformer", "layers_0", "post_attention_layernorm", "weight")),
-    ]
+    # Skip verification if params is None
+    if params is None:
+        return False, ["Parameters are None"]
     
-    # Extend mappings to all layers
-    extended_mappings = []
-    for src_pattern, tgt_pattern in mappings:
-        # Skip if not for a specific layer
-        if "layers_0" not in str(src_pattern):
-            extended_mappings.append((src_pattern, tgt_pattern))
-            continue
-            
-        # Apply mapping for each layer (0-31 should cover most models)
-        for layer_idx in range(32):
-            src_with_layer = list(src_pattern)
-            tgt_with_layer = list(tgt_pattern)
-            
-            # Replace layer index in patterns
-            for i, part in enumerate(src_with_layer):
-                if part == "layers_0":
-                    src_with_layer[i] = f"layers_{layer_idx}"
-            for i, part in enumerate(tgt_with_layer):
-                if part == "layers_0":
-                    tgt_with_layer[i] = f"layers_{layer_idx}"
-                    
-            extended_mappings.append((tuple(src_with_layer), tuple(tgt_with_layer)))
+    # Get required keys
+    required_keys = ["params"]
     
-    # Apply mappings and build new parameter dictionary
-    for source_key, value in flat_params.items():
-        # Keep original key
-        mapped_params[source_key] = value
-        
-        # Check if this key needs to be mapped
-        for source_pattern, target_pattern in extended_mappings:
-            # Check if source key matches pattern
-            if len(source_key) >= len(source_pattern) and all(s == k for s, k in zip(source_pattern, source_key[:len(source_pattern)])):
-                # Create mapped key with target pattern prefix and remaining source key parts
-                suffix = source_key[len(source_pattern):]
-                new_key = target_pattern + suffix
-                
-                # Add mapped version (but don't overwrite existing)
-                if new_key not in mapped_params:
-                    mapped_params[new_key] = value
-                    logger.debug(f"Mapped parameter: {source_key} → {new_key}")
-                break
+    # Check top-level keys
+    for key in required_keys:
+        if key not in params:
+            is_valid = False
+            missing_params.append(key)
     
-    # Count number of additional mappings created
-    original_count = len(flat_params)
-    new_count = len(mapped_params)
-    logger.info(f"Parameter mapping: added {new_count - original_count} parameter paths for compatibility")
+    # If no params key, can't check further
+    if "params" not in params:
+        return is_valid, missing_params
     
-    return unflatten_dict(mapped_params)
-
-def load_params_from_checkpoint(model, model_path):
-    """
-    Load parameters from checkpoint into the model.
-    
-    Args:
-        model: The model to load parameters into
-        model_path: Path to the checkpoint directory
-        
-    Returns:
-        Loaded model parameters
-    """
-    logger.info(f"Loading parameters from checkpoint: {model_path}")
-    params = None
-    
-    if hasattr(model, 'load_params_from_checkpoint'):
-        logger.info("Using model's built-in load_params_from_checkpoint method")
-        params = model.load_params_from_checkpoint(model_path)
+    # Check for transformer
+    if "transformer" not in params["params"]:
+        is_valid = False
+        missing_params.append("params.transformer")
     else:
-        logger.info("Using generic parameter loading")
-        from weight_loading import load_qwen_weights
-        params = load_qwen_weights(model_path, model, model.config)
+        # Check for embedding
+        if "embed_tokens" not in params["params"]["transformer"]:
+            is_valid = False
+            missing_params.append("params.transformer.embed_tokens")
+        elif "embedding" not in params["params"]["transformer"]["embed_tokens"]:
+            is_valid = False
+            missing_params.append("params.transformer.embed_tokens.embedding")
+        
+        # Check for final layer norm
+        if "ln_f" not in params["params"]["transformer"]:
+            is_valid = False
+            missing_params.append("params.transformer.ln_f")
+        
+        # Check for transformer layers
+        if "h" not in params["params"]["transformer"]:
+            is_valid = False
+            missing_params.append("params.transformer.h")
     
-    # Apply parameter path mapping to ensure compatibility
-    params = map_parameter_paths(params)
+    # Check for LM head
+    if "lm_head" not in params["params"]:
+        is_valid = False
+        missing_params.append("params.lm_head")
     
-    return params
+    return is_valid, missing_params
 
 # Define a proper standalone function for backward compatibility
 def load_params_from_checkpoint(model, model_path):
@@ -2009,32 +1898,19 @@ class TensorParallelQwenEmbed(nn.Module):
     @nn.compact
     def __call__(self, input_ids, position_ids=None, past_length=0):
         """Apply embedding with tensor parallelism."""
-        try:
-            # Instead of creating a nested QwenEmbed, initialize the embedding parameter directly
-            # with the same parameter name as in the original QwenEmbed
-            vocab_size = self.config.get("vocab_size", 152064)
-            hidden_size = self.config.get("hidden_size", 4096)
-            
-            # Initialize embedding with the standard name "weight" to match base implementation
-            embedding = self.param(
-                "weight",
-                nn.initializers.normal(stddev=0.02),
-                (vocab_size, hidden_size),
-                self.param_dtype
-            )
-            
-            # Log parameter shape for debugging
-            logger.debug(f"TensorParallelQwenEmbed: embedding shape={embedding.shape}")
-            
-            # Implement embedding lookup directly
-            embeds = jnp.take(embedding, input_ids, axis=0)
-            return embeds.astype(self.dtype)
-            
-        except Exception as e:
-            logger.warning(f"Error in TensorParallelQwenEmbed: {e}")
-            # Return a zeros tensor as fallback
-            return jnp.zeros((input_ids.shape[0], input_ids.shape[1], self.config.get("hidden_size", 4096)), 
-                            dtype=self.dtype)
+        # Create an instance of the base QwenEmbed
+        embed = QwenEmbed(
+            config=self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype
+        )
+        
+        # Call the base embedding implementation
+        return embed(
+            input_ids=input_ids, 
+            position_ids=position_ids, 
+            past_length=past_length
+        )
     
     def input_sharding_spec(self, dtype=jnp.int32):
         """Return the sharding spec for input tensors."""
