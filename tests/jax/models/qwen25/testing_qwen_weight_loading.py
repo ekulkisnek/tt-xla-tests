@@ -20,7 +20,17 @@ source venv/bin/activate
 
 python testing_qwen_weight_loading.py --weights_dir /root/wrkdir/tt-xla/tests/jax/models/qwen25/qwen25-weights
 
+memory_efficient
+python testing_qwen_weight_loading.py --weights_dir /root/wrkdir/tt-xla/tests/jax/models/qwen25/qwen25-weights --method all --test_forward --memory_efficient
+
+diagnose
+python testing_qwen_weight_loading.py --weights_dir /root/wrkdir/tt-xla/tests/jax/models/qwen25/qwen25-weights --method diagnose
+
 python testing_qwen_weight_loading.py --weights_dir /root/wrkdir/tt-xla/tests/jax/models/qwen25/qwen25-weights --method all --test_forward
+
+direct with forward
+python testing_qwen_weight_loading.py --weights_dir /root/wrkdir/tt-xla/tests/jax/models/qwen25/qwen25-weights --method direct --test_forward --memory_efficient
+
 
 The script will output detailed diagnostics about the weight loading process.
 """
@@ -142,6 +152,14 @@ def get_cached_weights(model_path, config, dtype):
     cache_key = f"{model_path}_{dtype}"
     if cache_key not in _weight_cache:
         logger.info("Loading weights (not found in cache)...")
+        
+        # Clear memory before loading
+        import gc
+        import jax
+        gc.collect()
+        jax.clear_caches()
+        
+        # Load the weights with optimized memory usage
         _weight_cache[cache_key] = load_safetensors_weights(model_path)
         
         # Log memory usage after loading
@@ -166,13 +184,28 @@ def test_direct_safetensors(model_path: str, config: Qwen25Config, dtype: jnp.dt
     logger.info("Testing direct loading from safetensors...")
     start_time = time.time()
     
+    # Clear caches before loading to free memory
+    import gc
+    gc.collect()
+    
     try:
         # Use cached weights if available
         params = get_cached_weights(model_path, config, dtype)
         logger.info(f"Successfully loaded weights in {time.time() - start_time:.2f} seconds")
+        
+        # Verify parameter structure
+        logger.info("Analyzing parameter structure...")
+        analysis = analyze_param_structure(params)
+        logger.info(f"Loaded {analysis['total_params']/1e9:.2f}B parameters across {analysis['num_tensors']} tensors")
+        logger.info(f"Detected {analysis['num_layers_detected']} transformer layers")
+        
+        # Force garbage collection before returning
+        gc.collect()
         return params
     except Exception as e:
         logger.error(f"Direct safetensors loading failed: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 def test_direct_load_from_index(model_path: str, config: Qwen25Config, dtype: jnp.dtype = jnp.float32) -> Dict:
@@ -193,6 +226,10 @@ def test_direct_load_from_index(model_path: str, config: Qwen25Config, dtype: jn
     # Import necessary modules here to control cleanup
     import gc
     import jax
+    
+    # Clear memory before starting
+    jax.clear_caches()
+    gc.collect()
     
     try:
         # Create model instance - with minimal initialization
@@ -220,6 +257,9 @@ def test_direct_load_from_index(model_path: str, config: Qwen25Config, dtype: jn
             # We got back a model
             logger.info("Received model object with parameters already set")
             model = model_or_params
+            # Clean up original model
+            del model_or_params
+            gc.collect()
         else:
             # We got back parameters - need to fix structure and update model
             logger.info("Got parameters instead of model - fixing structure and updating model")
@@ -231,6 +271,7 @@ def test_direct_load_from_index(model_path: str, config: Qwen25Config, dtype: jn
             # Clear references to old parameter structure
             del model_or_params
             gc.collect()
+            jax.clear_caches()
             
             # Update model parameters
             logger.info("Updating model parameters...")
@@ -239,6 +280,7 @@ def test_direct_load_from_index(model_path: str, config: Qwen25Config, dtype: jn
             # Clear references
             del params
             gc.collect()
+            jax.clear_caches()
         
         logger.info(f"Successfully loaded weights in {time.time() - start_time:.2f} seconds")
         return model
@@ -293,7 +335,15 @@ def test_forward_pass(model, config: Qwen25Config, tokenizer=None) -> bool:
     """
     logger.info("Testing forward pass with loaded weights...")
     
+    # Import for memory management
+    import gc
+    import jax
+    
     try:
+        # Clear caches before forward pass
+        gc.collect()
+        jax.clear_caches()
+        
         # Verify essential parameters first
         logger.info("Verifying model parameters before forward pass...")
         if hasattr(model, 'params'):
@@ -318,11 +368,18 @@ def test_forward_pass(model, config: Qwen25Config, tokenizer=None) -> bool:
                     ('params', 'model', 'embed_tokens', 'embedding'),
                     ('params', 'lm_head', 'kernel'),
                     ('params', 'model', 'layers', 'norm', 'scale')
+                ],
+                # Format 3: With nested layers_0 structure
+                [
+                    ('params', 'model', 'embed_tokens', 'embedding'),
+                    ('params', 'lm_head', 'kernel'),
+                    ('params', 'model', 'layers', 'layers_0', 'attention', 'q_proj', 'kernel')
                 ]
             ]
             
             # For each parameter set, check if any are missing
             format_found = False
+            missing_patterns = {}
             for param_set in essential_param_patterns:
                 missing_params = []
                 for param_path in param_set:
@@ -333,21 +390,39 @@ def test_forward_pass(model, config: Qwen25Config, tokenizer=None) -> bool:
                 if not missing_params:
                     format_found = True
                     break
+                else:
+                    missing_patterns['/'.join(param_path for param_path in param_set if '/'.join(param_path) not in missing_params)] = missing_params
             
             if not format_found:
                 logger.error(f"Missing essential parameters for all supported formats")
-                logger.info("Available top-level parameters:")
-                if 'params' in model.params:
-                    logger.info(f"  params keys: {list(model.params['params'].keys())}")
-                    if 'model' in model.params['params']:
-                        logger.info(f"  model keys: {list(model.params['params']['model'].keys())}")
-                    if 'layers' in model.params['params']:
-                        logger.info(f"  layers keys: {list(model.params['params']['layers'].keys())}")
-                    elif 'model' in model.params['params'] and 'layers' in model.params['params']['model']:
-                        logger.info(f"  model/layers keys: {list(model.params['params']['model']['layers'].keys())}")
+                for format_pattern, missing in missing_patterns.items():
+                    logger.info(f"Format pattern {format_pattern} missing: {missing}")
+                
+                # Log available paths to help diagnose the issue
+                logger.info("Available parameter patterns:")
+                
+                # Sample a few keys to see what's available
+                sample_paths = set()
+                for key in flat_params.keys():
+                    path_parts = []
+                    for part in key[:3]:  # Just use the first few parts of the path
+                        path_parts.append(part)
+                        pattern = '/'.join(path_parts)
+                        sample_paths.add(pattern)
+                    if len(sample_paths) >= 10:
+                        break
+                
+                for pattern in sorted(sample_paths):
+                    logger.info(f"  {pattern}...")
                 
                 # If no matching format, analyze largest tensors to help diagnose the issue
                 log_tensor_sizes(model.params)
+                
+                # Clear memory
+                del flat_params
+                gc.collect()
+                jax.clear_caches()
+                
                 return False
             
             # Check parameter shapes for key components - try both formats
@@ -370,7 +445,11 @@ def test_forward_pass(model, config: Qwen25Config, tokenizer=None) -> bool:
                 expected_shape = (config.hidden_size, config.vocab_size)
                 if lm_head_shape != expected_shape:
                     logger.warning(f"LM head shape mismatch: got {lm_head_shape}, expected {expected_shape}")
-                
+            
+            # Clean up
+            del flat_params
+            gc.collect()
+            
             logger.info("Model parameter verification completed")
         
         # Create a simple input
@@ -391,8 +470,8 @@ def test_forward_pass(model, config: Qwen25Config, tokenizer=None) -> bool:
         logger.info(f"Using input shape: {input_ids.shape}")
         
         # Add explicit garbage collection before forward pass
-        import gc
         gc.collect()
+        jax.clear_caches()
         
         # Run forward pass with error handling
         try:
@@ -426,6 +505,11 @@ def test_forward_pass(model, config: Qwen25Config, tokenizer=None) -> bool:
             # Assume first output is logits in tuple case
             logits = outputs[0]
         
+        # Clear outputs to free memory
+        del outputs
+        gc.collect()
+        jax.clear_caches()
+        
         # Logits should have shape [batch_size, seq_len, vocab_size]
         expected_shape = (input_ids.shape[0], input_ids.shape[1], config.vocab_size)
         
@@ -444,6 +528,11 @@ def test_forward_pass(model, config: Qwen25Config, tokenizer=None) -> bool:
             # Check the range of values in the output
             logits_abs_max = float(jnp.max(jnp.abs(logits)))
             logger.info(f"Maximum absolute logit value: {logits_abs_max:.2f}")
+            
+            # Clean up
+            del logits
+            gc.collect()
+            jax.clear_caches()
             
             return True
         else:
@@ -504,7 +593,7 @@ def verify_parameter_mapping(model_params: Dict) -> Dict[str, bool]:
     for i in range(100):  # Check up to 100 layers
         layer_found = False
         for key in keys:
-            if f"layers/{i}" in key or f"layers.{i}" in key or f"layers_{i}" in key:
+            if f"layers/{i}" in key or f"layers_(\d+)/" in key or f"layers\.(\d+)\." in key or f"layers\.(\d+)/" in key or f"layers/layers_(\d+)/" in key:
                 layer_found = True
                 break
         
@@ -738,6 +827,9 @@ def fix_params_structure(weights):
     """
     logger.info("Restructuring parameters to match FlaxQwen25ForCausalLM")
     
+    # Import garbage collection to manage memory
+    import gc
+    
     # Initialize the restructured parameters dict
     fixed_params = {"params": {}}
     
@@ -759,26 +851,46 @@ def fix_params_structure(weights):
     logger.info(f"Detected model structure: vocab_size={config.get('vocab_size', 'unknown')}, "
                 f"hidden_size={config.get('hidden_size', 'unknown')}, layers={layer_count}")
     
+    # Use direct layer format - from code inspection we know FlaxQwen25LayerCollection
+    # in qwen25_full_implementation.py uses the "layers_X" format
+    # This is the critical part that was causing issues
+    layer_pattern = 'layers_{}'
+    logger.info(f"Using layer pattern 'layers_X' from code inspection")
+    
     # Mapping from PyTorch parameter names to Flax parameter structure
     mappings = {
         # Embeddings
         "model.embed_tokens.weight": ("model", "embed_tokens", "embedding"),
         
         # Layer mappings (will be formatted with layer number)
-        "model.layers.{}.self_attn.q_proj.weight": ("model", "layers_{}", "self_attn", "q_proj", "kernel"),
-        "model.layers.{}.self_attn.k_proj.weight": ("model", "layers_{}", "self_attn", "k_proj", "kernel"),
-        "model.layers.{}.self_attn.v_proj.weight": ("model", "layers_{}", "self_attn", "v_proj", "kernel"),
-        "model.layers.{}.self_attn.o_proj.weight": ("model", "layers_{}", "self_attn", "o_proj", "kernel"),
+        # Using the "layers_X" format with "attention" not "self_attn"
+        "model.layers.{}.self_attn.q_proj.weight": ("model", "layers", layer_pattern, "attention", "q_proj", "kernel"),
+        "model.layers.{}.self_attn.k_proj.weight": ("model", "layers", layer_pattern, "attention", "k_proj", "kernel"),
+        "model.layers.{}.self_attn.v_proj.weight": ("model", "layers", layer_pattern, "attention", "v_proj", "kernel"),
+        "model.layers.{}.self_attn.o_proj.weight": ("model", "layers", layer_pattern, "attention", "o_proj", "kernel"),
         
-        "model.layers.{}.mlp.gate_proj.weight": ("model", "layers_{}", "mlp", "gate_proj", "kernel"),
-        "model.layers.{}.mlp.up_proj.weight": ("model", "layers_{}", "mlp", "up_proj", "kernel"),
-        "model.layers.{}.mlp.down_proj.weight": ("model", "layers_{}", "mlp", "down_proj", "kernel"),
+        # Add bias terms if they exist
+        "model.layers.{}.self_attn.q_proj.bias": ("model", "layers", layer_pattern, "attention", "q_proj", "bias"),
+        "model.layers.{}.self_attn.k_proj.bias": ("model", "layers", layer_pattern, "attention", "k_proj", "bias"),
+        "model.layers.{}.self_attn.v_proj.bias": ("model", "layers", layer_pattern, "attention", "v_proj", "bias"),
+        "model.layers.{}.self_attn.o_proj.bias": ("model", "layers", layer_pattern, "attention", "o_proj", "bias"),
         
-        "model.layers.{}.input_layernorm.weight": ("model", "layers_{}", "input_layernorm", "scale"),
-        "model.layers.{}.post_attention_layernorm.weight": ("model", "layers_{}", "post_attention_layernorm", "scale"),
+        "model.layers.{}.mlp.gate_proj.weight": ("model", "layers", layer_pattern, "mlp", "gate_proj", "kernel"),
+        "model.layers.{}.mlp.up_proj.weight": ("model", "layers", layer_pattern, "mlp", "up_proj", "kernel"),
+        "model.layers.{}.mlp.down_proj.weight": ("model", "layers", layer_pattern, "mlp", "down_proj", "kernel"),
         
-        # Final layer norm
-        "model.norm.weight": ("model", "norm", "scale"),
+        # Add bias terms if they exist
+        "model.layers.{}.mlp.gate_proj.bias": ("model", "layers", layer_pattern, "mlp", "gate_proj", "bias"),
+        "model.layers.{}.mlp.up_proj.bias": ("model", "layers", layer_pattern, "mlp", "up_proj", "bias"),
+        "model.layers.{}.mlp.down_proj.bias": ("model", "layers", layer_pattern, "mlp", "down_proj", "bias"),
+        
+        "model.layers.{}.input_layernorm.weight": ("model", "layers", layer_pattern, "input_layernorm", "scale"),
+        "model.layers.{}.post_attention_layernorm.weight": ("model", "layers", layer_pattern, "post_attention_layernorm", "scale"),
+        
+        # Final layer norm - IMPORTANT: This was moved to be under "layers" instead of directly under "model"
+        # From: "model.norm.weight": ("model", "norm", "scale"),
+        # To:
+        "model.norm.weight": ("model", "layers", "norm", "scale"),
         
         # Language model head
         "lm_head.weight": ("lm_head", "kernel"),
@@ -789,51 +901,72 @@ def fix_params_structure(weights):
     
     # First, handle the layer-specific weights
     for layer_idx in range(layer_count):
-        for src_pattern, dst_path in mappings.items():
+        # Process each layer and free memory after
+        layer_keys_to_process = []
+        
+        # Find all keys for this layer
+        for src_pattern in mappings:
             if "{}" in src_pattern:
                 src_key = src_pattern.format(layer_idx)
                 if src_key in weights:
-                    # Create path in the params dictionary
-                    current = fixed_params["params"]
-                    for part in dst_path[:-1]:
-                        part_name = part.format(layer_idx) if "{}" in part else part
-                        if part_name not in current:
-                            current[part_name] = {}
-                        current = current[part_name]
-                    
-                    # Add the weight tensor, handling necessary transformations
-                    last_part = dst_path[-1].format(layer_idx) if "{}" in dst_path[-1] else dst_path[-1]
-                    
-                    # Special handling for weight matrices - transpose kernel matrices for Flax
-                    if last_part == "kernel":
-                        current[last_part] = weights[src_key].T  # Transpose for Flax
-                    else:
-                        current[last_part] = weights[src_key]
-                    
-                    processed_keys.add(src_key)
-    
-    # Handle non-layer specific weights
-    for src_key, dst_path in mappings.items():
-        if "{}" not in src_key and src_key in weights:
+                    layer_keys_to_process.append((src_key, src_pattern))
+        
+        # Process this layer's keys
+        for src_key, src_pattern in layer_keys_to_process:
+            dst_path = mappings[src_pattern]
+            
             # Create path in the params dictionary
             current = fixed_params["params"]
             for part in dst_path[:-1]:
-                if part not in current:
-                    current[part] = {}
-                current = current[part]
+                # Ensure correct layer path format
+                if part == layer_pattern:
+                    part_name = part.format(layer_idx)
+                else:
+                    part_name = part.format(layer_idx) if "{}" in part else part
+                
+                if part_name not in current:
+                    current[part_name] = {}
+                current = current[part_name]
             
             # Add the weight tensor, handling necessary transformations
-            last_part = dst_path[-1]
+            last_part = dst_path[-1].format(layer_idx) if "{}" in dst_path[-1] else dst_path[-1]
             
             # Special handling for weight matrices - transpose kernel matrices for Flax
             if last_part == "kernel":
                 current[last_part] = weights[src_key].T  # Transpose for Flax
-            elif last_part == "embedding":
-                current[last_part] = weights[src_key]  # Don't transpose embeddings
             else:
                 current[last_part] = weights[src_key]
             
             processed_keys.add(src_key)
+        
+        # Force garbage collection after each layer is processed
+        if layer_idx % 5 == 0:  # Every 5 layers
+            gc.collect()
+    
+    # Handle non-layer specific weights
+    non_layer_keys = [k for k in mappings if "{}" not in k and k in weights]
+    for src_key in non_layer_keys:
+        dst_path = mappings[src_key]
+        
+        # Create path in the params dictionary
+        current = fixed_params["params"]
+        for part in dst_path[:-1]:
+            if part not in current:
+                current[part] = {}
+            current = current[part]
+        
+        # Add the weight tensor, handling necessary transformations
+        last_part = dst_path[-1]
+        
+        # Special handling for weight matrices - transpose kernel matrices for Flax
+        if last_part == "kernel":
+            current[last_part] = weights[src_key].T  # Transpose for Flax
+        elif last_part == "embedding":
+            current[last_part] = weights[src_key]  # Don't transpose embeddings
+        else:
+            current[last_part] = weights[src_key]
+        
+        processed_keys.add(src_key)
     
     # Log stats about the conversion
     total_keys = len(weights)
@@ -843,6 +976,23 @@ def fix_params_structure(weights):
         # Log a sample of unprocessed keys for debugging
         unprocessed = set(weights.keys()) - processed_keys
         logger.warning(f"Unable to map {len(unprocessed)} keys, first 10: {list(unprocessed)[:10]}")
+    
+    # Add debug output for norm-related parameters
+    flat_params = flatten_dict(fixed_params)
+    norm_params = [k for k in flat_params.keys() if 'norm' in '/'.join(k)]
+    logger.info("Norm-related parameters after mapping:")
+    for k in norm_params:
+        logger.info(f"  {'/'.join(k)}: {flat_params[k].shape}")
+    
+    # Check for the critical parameter that was causing issues
+    critical_param = ('params', 'model', 'layers', 'norm', 'scale')
+    if critical_param in flat_params:
+        logger.info(f"✓ Critical parameter {'/'.join(critical_param)} exists in mapped structure")
+    else:
+        logger.warning(f"❌ Critical parameter {'/'.join(critical_param)} is MISSING in mapped structure")
+    
+    # Force garbage collection before returning
+    gc.collect()
     
     return fixed_params
 
@@ -1079,20 +1229,377 @@ def load_weights_with_slices(checkpoint_files, slice_size=1000):
     logger.info(f"Successfully loaded all weights with {len(weights)} tensors")
     return weights
 
+def report_structure_mismatch(expected, actual):
+    """
+    Report differences between expected and actual parameter structures.
+    
+    Args:
+        expected: Expected parameter structure (dictionary of parameter paths → shapes)
+        actual: Actual parameter structure (flattened)
+    """
+    missing_keys = set(expected.keys()) - set(actual.keys())
+    extra_keys = set(actual.keys()) - set(expected.keys())
+    
+    print(f"Missing {len(missing_keys)} parameters, extra {len(extra_keys)} parameters")
+    
+    # Identify patterns in missing keys
+    missing_patterns = {}
+    for key in missing_keys:
+        # Create pattern by replacing numbers with X
+        import re
+        pattern = re.sub(r'\d+', 'X', '/'.join(key) if isinstance(key, tuple) else str(key))
+        if pattern not in missing_patterns:
+            missing_patterns[pattern] = []
+        missing_patterns[pattern].append(key)
+    
+    print("\nMissing parameter patterns:")
+    for pattern, examples in missing_patterns.items():
+        print(f"  {pattern}: {len(examples)} parameters")
+        print(f"    Example: {examples[0]}")
+    
+    # Check for shape mismatches in parameters that exist in both
+    common_keys = set(expected.keys()) & set(actual.keys())
+    shape_mismatches = []
+    
+    for key in common_keys:
+        expected_shape = expected[key]
+        actual_shape = actual[key].shape if hasattr(actual[key], 'shape') else None
+        
+        if expected_shape is not None and actual_shape is not None and expected_shape != actual_shape:
+            shape_mismatches.append((key, expected_shape, actual_shape))
+    
+    if shape_mismatches:
+        print("\nShape mismatches:")
+        for key, expected_shape, actual_shape in shape_mismatches:
+            print(f"  {key}: expected {expected_shape}, got {actual_shape}")
+    
+    return missing_keys, extra_keys
+
+def get_expected_parameter_structure(config):
+    """
+    Create a model instance and extract its expected parameter structure.
+    
+    Args:
+        config: Model configuration
+        
+    Returns:
+        Dictionary of expected parameter structure information
+    """
+    logger.info("Creating reference model to get expected parameter structure...")
+    
+    # Import necessary modules for memory management
+    import gc
+    import jax
+    
+    # Clear memory before creating model
+    jax.clear_caches()
+    gc.collect()
+    
+    # Create a model with minimal configuration for memory efficiency
+    # Use smallest valid values to minimize memory usage
+    minimal_config = Qwen25Config(
+        vocab_size=config.vocab_size,
+        hidden_size=config.hidden_size,
+        intermediate_size=config.intermediate_size,
+        num_hidden_layers=config.num_hidden_layers,
+        num_attention_heads=config.num_attention_heads,
+        num_key_value_heads=config.num_key_value_heads,
+    )
+    
+    try:
+        # Create a reference model but with no parameter initialization
+        reference_model = FlaxQwen25ForCausalLM(minimal_config, _do_init=False)
+        
+        # Create empty parameter structure with correct paths but minimal values
+        from jax import random
+        rng = random.PRNGKey(0)
+        # Only initialize with tiny dummy inputs (1x1) to minimize memory
+        variables = reference_model.module.init(rng, jnp.ones((1, 1), dtype=jnp.int32))
+        
+        # Extract structure but not actual tensors
+        flat_params = flatten_dict(variables)
+        
+        # Create structure dictionary with just paths and shapes
+        structure_info = {}
+        for key, value in flat_params.items():
+            structure_info[key] = getattr(value, "shape", None)
+        
+        # Clear out variables to free memory
+        del variables
+        del reference_model
+        gc.collect()
+        jax.clear_caches()
+        
+        # Log a sample of the structure
+        sample_keys = list(structure_info.keys())[:5]
+        logger.info(f"Sample expected parameters (first 5):")
+        for key in sample_keys:
+            key_str = '/'.join(key)
+            logger.info(f"  {key_str}: {structure_info[key]}")
+        
+        return structure_info
+    except Exception as e:
+        logger.error(f"Error getting expected parameter structure: {e}")
+        import traceback
+        traceback.print_exc()
+        return {}
+
+def print_model_expected_structure(config):
+    """
+    Create an empty model and print its expected parameter structure.
+    
+    Args:
+        config: Model configuration
+    """
+    logger.info("Creating model to inspect expected parameter structure...")
+    
+    # Import necessary modules for memory management
+    import gc
+    import jax
+    
+    try:
+        # Create a model with minimal initialization
+        model = FlaxQwen25ForCausalLM(config, _do_init=True)
+        
+        # Get flattened parameters
+        flat_params = flatten_dict(model.params)
+        
+        # Print all norm-related parameters to help debug
+        logger.info("Expected norm-related parameters:")
+        for key in sorted(['/'.join(k) for k in flat_params.keys() if 'norm' in '/'.join(k)]):
+            logger.info(f"  {key}")
+        
+        # Print a sample of parameters from different components
+        param_categories = {
+            'embed': [],
+            'attention': [],
+            'mlp': [],
+            'layernorm': [],
+            'lm_head': []
+        }
+        
+        for key in flat_params.keys():
+            key_str = '/'.join(key)
+            for category in param_categories:
+                if category in key_str.lower():
+                    param_categories[category].append(key_str)
+                    break
+        
+        logger.info("Sample parameters from different components:")
+        for category, params in param_categories.items():
+            if params:
+                logger.info(f"  {category}: {params[0]}")
+        
+        # Check for specific problematic parameter
+        if ('params', 'model', 'layers', 'norm', 'scale') in flat_params:
+            logger.info("✓ Critical parameter 'params/model/layers/norm/scale' exists in expected structure")
+        else:
+            logger.warning("❌ Critical parameter 'params/model/layers/norm/scale' NOT FOUND in expected structure")
+            # Try to find similar parameters
+            similar_params = ['/'.join(k) for k in flat_params.keys() if 'norm' in '/'.join(k) and 'scale' in '/'.join(k)]
+            logger.info(f"Similar parameters: {similar_params}")
+        
+        # Clean up
+        del model
+        del flat_params
+        gc.collect()
+        jax.clear_caches()
+        
+        return True
+    except Exception as e:
+        logger.error(f"Error inspecting model structure: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def compare_param_structures(reference_model, fixed_params):
+    """
+    Compare parameter structures between reference model and fixed params.
+    
+    Args:
+        reference_model: Reference model with expected parameter structure
+        fixed_params: Parameter dictionary to compare
+        
+    Returns:
+        Tuple of (missing_keys, extra_keys)
+    """
+    logger.info("Comparing parameter structures...")
+    
+    # Flatten both parameter structures
+    ref_flat = flatten_dict(reference_model.params)
+    actual_flat = flatten_dict(fixed_params)
+    
+    # Convert keys to strings for easier comparison and display
+    ref_keys = set(['/'.join(k) for k in ref_flat.keys()])
+    actual_keys = set(['/'.join(k) for k in actual_flat.keys()])
+    
+    # Find differences
+    missing_keys = ref_keys - actual_keys
+    extra_keys = actual_keys - ref_keys
+    
+    # Report statistics
+    logger.info(f"Total expected parameters: {len(ref_keys)}")
+    logger.info(f"Total actual parameters: {len(actual_keys)}")
+    logger.info(f"Missing parameters: {len(missing_keys)}")
+    logger.info(f"Extra parameters: {len(extra_keys)}")
+    
+    # Show specific missing parameters (limit to first 10)
+    if missing_keys:
+        logger.info("Missing parameters (first 10):")
+        for key in sorted(list(missing_keys)[:10]):
+            logger.info(f"  Missing: {key}")
+    
+    # Return the raw key tuples for potential fixes
+    return (
+        [k for k in ref_flat.keys() if '/'.join(k) in missing_keys],
+        [k for k in actual_flat.keys() if '/'.join(k) in extra_keys]
+    )
+
+def fix_missing_parameters(params, model_class, config):
+    """
+    Fix parameter structure for compatibility with model_class expectations.
+    
+    Args:
+        params: Parameter dictionary to fix
+        model_class: Model class to check against
+        config: Model configuration
+        
+    Returns:
+        Fixed parameter dictionary
+    """
+    logger.info("Fixing missing parameters...")
+    
+    # Import for memory management
+    import gc
+    import jax
+    
+    # Create a copy of params to modify
+    fixed_params = unfreeze(params) if hasattr(params, 'unfreeze') else params.copy()
+    
+    try:
+        # Flatten the parameters
+        flat_params = flatten_dict(fixed_params)
+        
+        # Create a minimal model to get expected structure
+        tmp_model = model_class(config, _do_init=True)
+        expected_flat = flatten_dict(tmp_model.params)
+        
+        # Get lists of keys
+        expected_keys = set(expected_flat.keys())
+        actual_keys = set(flat_params.keys())
+        
+        # Find missing keys
+        missing_keys = expected_keys - actual_keys
+        
+        if missing_keys:
+            logger.info(f"Found {len(missing_keys)} missing parameters to fix")
+            
+            # Create mappings for parameter name patterns
+            # This maps potential source keys to destination keys
+            potential_mappings = {
+                # Key format issue: missing 'layers' in the path for norm
+                ('params', 'model', 'norm', 'scale'): ('params', 'model', 'layers', 'norm', 'scale'),
+                
+                # Other potential mappings
+                ('params', 'norm', 'scale'): ('params', 'model', 'layers', 'norm', 'scale'),
+            }
+            
+            # Check all pre-defined mappings
+            fixes_applied = 0
+            for src_key, dst_key in potential_mappings.items():
+                if src_key in flat_params and dst_key in missing_keys:
+                    logger.info(f"Fixing: Moving {'/'.join(src_key)} -> {'/'.join(dst_key)}")
+                    # Copy the parameter to the correct location
+                    flat_params[dst_key] = flat_params[src_key]
+                    fixes_applied += 1
+            
+            # If no predefined mappings worked, try to find by parameter name similarity
+            if fixes_applied == 0:
+                logger.info("No predefined mappings worked, trying similarity matching")
+                
+                # Group parameters by their last path component (parameter name)
+                param_name_map = {}
+                for key in flat_params.keys():
+                    param_name = key[-1]
+                    if param_name not in param_name_map:
+                        param_name_map[param_name] = []
+                    param_name_map[param_name].append(key)
+                
+                # For each missing key, try to find a matching parameter by name
+                for missing_key in missing_keys:
+                    missing_name = missing_key[-1]
+                    if missing_name in param_name_map:
+                        # Found potential matches by parameter name
+                        candidates = param_name_map[missing_name]
+                        
+                        # Check if shapes are compatible
+                        for candidate_key in candidates:
+                            if flat_params[candidate_key].shape == expected_flat[missing_key].shape:
+                                logger.info(f"Fixing by similarity: {'/'.join(candidate_key)} -> {'/'.join(missing_key)}")
+                                flat_params[missing_key] = flat_params[candidate_key]
+                                fixes_applied += 1
+                                break
+            
+            logger.info(f"Applied {fixes_applied} parameter fixes")
+        
+        # Check if the specific problematic norm parameter was fixed
+        critical_param = ('params', 'model', 'layers', 'norm', 'scale')
+        if critical_param in missing_keys and critical_param not in flat_params:
+            logger.warning(f"Critical parameter {'/'.join(critical_param)} still missing")
+            
+            # Last resort: try extracting from similar sources
+            norm_sources = [k for k in flat_params.keys() if 'norm' in '/'.join(k) and 'scale' in '/'.join(k)]
+            if norm_sources:
+                src_key = norm_sources[0]
+                logger.info(f"Last resort fix: Using {'/'.join(src_key)} for {'/'.join(critical_param)}")
+                flat_params[critical_param] = flat_params[src_key]
+        
+        # Unflatten the parameters
+        result_params = unflatten_dict(flat_params)
+        
+        # Clean up
+        del tmp_model
+        del flat_params
+        del expected_flat
+        gc.collect()
+        jax.clear_caches()
+        
+        return result_params
+    except Exception as e:
+        logger.error(f"Error fixing parameters: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # Return original params if fixing failed
+        return params
+
 def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(description="Load and convert Qwen 2.5 PyTorch weights to Flax format")
+    """Main entry point for testing Qwen 2.5 weight loading."""
+    parser = argparse.ArgumentParser(description="Test Qwen 2.5 weight loading")
     parser.add_argument(
-        "--checkpoint_dir",
+        "--weights_dir",
         type=str,
         required=True,
-        help="Directory containing the PyTorch safetensors checkpoint files",
+        help="Directory containing the weight files",
     )
     parser.add_argument(
-        "--output_dir",
+        "--method",
         type=str,
-        required=True,
-        help="Directory to save the converted Flax model weights",
+        default="direct",
+        choices=["direct", "index", "model", "all", "diagnose", "check_structure"],
+        help="Weight loading method to test, or 'diagnose'/'check_structure' for diagnostics",
+    )
+    parser.add_argument(
+        "--test_forward",
+        action="store_true",
+        help="Test a forward pass with the loaded weights",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="float32",
+        choices=["float32", "float16", "bfloat16"],
+        help="Data type to use for weights",
     )
     parser.add_argument(
         "--slice_size",
@@ -1100,38 +1607,242 @@ def main():
         default=1000,
         help="Size of parameter slices to load at once (in millions of parameters)",
     )
+    parser.add_argument(
+        "--memory_efficient",
+        action="store_true",
+        help="Enable more aggressive memory management (slower but uses less RAM)",
+    )
+    parser.add_argument(
+        "--alt_loading",
+        action="store_true",
+        help="Use alternative loading method from qwen25_full_implementation.py",
+    )
+    parser.add_argument(
+        "--auto_fix",
+        action="store_true",
+        help="Attempt to automatically fix parameter structure issues",
+    )
     args = parser.parse_args()
 
-    # Setup logging
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        level=logging.INFO,
-    )
+    # Import necessary modules for memory management
+    import gc
+    import jax
+    
+    # Clear memory at the start
+    gc.collect()
+    jax.clear_caches()
 
-    # Find checkpoint files
-    checkpoint_files = sorted(glob.glob(os.path.join(args.checkpoint_dir, "*.safetensors")))
-    if not checkpoint_files:
-        raise ValueError(f"No safetensors files found in {args.checkpoint_dir}")
-    
-    logger.info(f"Found {len(checkpoint_files)} checkpoint files")
-    
-    # Load weights with memory-efficient slicing
-    torch_weights = load_weights_with_slices(checkpoint_files, slice_size=args.slice_size)
-    
-    # Convert weights to Flax format
-    logger.info("Converting weights to Flax format...")
-    flax_params = fix_params_structure(torch_weights)
-    
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
-    
-    # Save the converted weights
-    logger.info(f"Saving converted weights to {args.output_dir}")
-    with open(os.path.join(args.output_dir, "model.msgpack"), "wb") as f:
-        f.write(msgpack.dumps(flax_params))
-    
-    logger.info("Conversion complete!")
+    # Map dtype string to jnp.dtype
+    dtype_map = {
+        "float32": jnp.float32,
+        "float16": jnp.float16,
+        "bfloat16": jnp.bfloat16,
+    }
+    dtype = dtype_map[args.dtype]
+
+    # Load config from weights directory
+    config_path = os.path.join(args.weights_dir, "config.json")
+    if os.path.exists(config_path):
+        logger.info(f"Loading config from {config_path}")
+        config = load_config_from_json(config_path)
+    else:
+        logger.warning(f"Config file not found at {config_path}, using default config")
+        config = Qwen25Config()
+
+    # Special structure check mode
+    if args.method == "check_structure":
+        logger.info("=== Checking expected model parameter structure ===")
+        print_model_expected_structure(config)
+        return
+
+    # Special diagnostic mode
+    if args.method == "diagnose":
+        logger.info("=== Running parameter structure diagnostics ===")
+        
+        # Log first what we're expecting
+        logger.info("Intended parameter structure from code inspection:")
+        logger.info("- Top level: params/model/layers/layers_X/attention/q_proj/kernel")
+        logger.info("- Final norm: params/model/layers/norm/scale (moved from params/model/norm/scale)")
+        logger.info("- Note the 'layers/layers_X' double nesting and 'attention' (not 'self_attn')")
+        
+        # Check expected structure from a minimal model
+        logger.info("Checking structure from a minimal model...")
+        print_model_expected_structure(config)
+        
+        # Load weights
+        logger.info("Loading weights for structure analysis...")
+        weights = test_direct_safetensors(args.weights_dir, config, dtype)
+        
+        if weights is not None:
+            # Try out our conversion without expensive validation
+            try:
+                logger.info("Testing parameter structure conversion...")
+                fixed_params = fix_params_structure(weights)
+                
+                # Clear original weights to free memory
+                del weights
+                gc.collect()
+                
+                # Do a simple check for expected keys
+                flat_params = flatten_dict(fixed_params)
+                has_embedding = any('embed_tokens' in '/'.join(k) for k in flat_params.keys())
+                has_layer_0 = any('layers_0' in '/'.join(k) for k in flat_params.keys())
+                has_lm_head = any('lm_head' in '/'.join(k) for k in flat_params.keys())
+                
+                # Check for final norm specifically
+                has_final_norm = ('params', 'model', 'layers', 'norm', 'scale') in flat_params
+                
+                if has_embedding and has_layer_0 and has_lm_head and has_final_norm:
+                    logger.info("✅ Basic structure validation passed")
+                    
+                    # Sample some parameters for inspection
+                    sample_keys = []
+                    for k in flat_params.keys():
+                        key_str = '/'.join(k)
+                        if 'layers_0' in key_str or 'embed_tokens' in key_str or 'lm_head' in key_str or 'norm' in key_str:
+                            sample_keys.append(k)
+                        if len(sample_keys) >= 10:
+                            break
+                            
+                    logger.info("Sample parameter paths:")
+                    for k in sample_keys:
+                        logger.info(f"  {'/'.join(k)}: {flat_params[k].shape}")
+                else:
+                    logger.error("❌ Basic structure validation failed!")
+                    logger.info("Missing critical components in structure:")
+                    logger.info(f"  Embeddings present: {has_embedding}")
+                    logger.info(f"  Layer 0 present: {has_layer_0}")
+                    logger.info(f"  LM head present: {has_lm_head}")
+                    logger.info(f"  Final norm present: {has_final_norm}")
+                
+                # Clear structures to free memory
+                del flat_params
+                del fixed_params
+                gc.collect()
+            except Exception as e:
+                logger.error(f"Error during structure conversion: {e}")
+        
+        logger.info("Diagnostic mode completed.")
+        return
+
+    # Load tokenizer if available for forward pass testing
+    tokenizer = None
+    if args.test_forward:
+        try:
+            logger.info(f"Loading tokenizer from {args.weights_dir}")
+            tokenizer = AutoTokenizer.from_pretrained(args.weights_dir)
+        except Exception as e:
+            logger.warning(f"Failed to load tokenizer: {e}")
+
+    # Use alternative loading if specified
+    if args.alt_loading:
+        logger.info("=== Using alternative loading method ===")
+        try:
+            from qwen25_full_implementation import load_model_and_weights
+            
+            # Clear memory before loading
+            gc.collect()
+            jax.clear_caches()
+            
+            logger.info(f"Loading model directly using load_model_and_weights...")
+            model = load_model_and_weights(args.weights_dir, dtype=dtype)
+            
+            if model is not None and args.test_forward:
+                logger.info("Testing forward pass with alternatively loaded weights...")
+                test_forward_pass(model, config, tokenizer)
+            
+            return
+        except Exception as e:
+            logger.error(f"Alternative loading failed: {e}")
+            import traceback
+            traceback.print_exc()
+            # Continue with regular loading if alternative fails
+
+    # Test loading with the selected method(s)
+    if args.method in ["direct", "all"]:
+        logger.info("=== Testing direct safetensors loading ===")
+        params = test_direct_safetensors(args.weights_dir, config, dtype)
+        
+        if params is not None:
+            if args.test_forward:
+                # Need to create a model with the params for forward pass testing
+                logger.info("Creating model and setting parameters...")
+                
+                # Create model with minimal memory usage
+                jax.clear_caches()
+                gc.collect()
+                
+                model = FlaxQwen25ForCausalLM(config, dtype=dtype)
+                
+                # Handle possible memory constraints
+                if args.memory_efficient:
+                    logger.info("Using memory-efficient parameter conversion...")
+                    # Process params incrementally to avoid holding two full copies
+                    import gc
+                    fixed_params = fix_params_structure(params)
+                    
+                    # Apply auto fix if requested
+                    if args.auto_fix:
+                        logger.info("Applying automatic parameter structure fixes...")
+                        fixed_params = fix_missing_parameters(fixed_params, FlaxQwen25ForCausalLM, config)
+                    
+                    # Clear original params to free memory
+                    del params
+                    gc.collect()
+                    jax.clear_caches()
+                    
+                    # Set parameters
+                    logger.info("Setting model parameters...")
+                    model.params = fixed_params
+                    
+                    # Clear parameter copy to free memory
+                    del fixed_params
+                    gc.collect()
+                    jax.clear_caches()
+                else:
+                    # Standard conversion
+                    logger.info("Converting parameters to model format...")
+                    fixed_params = fix_params_structure(params)
+                    
+                    # Apply auto fix if requested
+                    if args.auto_fix:
+                        logger.info("Applying automatic parameter structure fixes...")
+                        fixed_params = fix_missing_parameters(fixed_params, FlaxQwen25ForCausalLM, config)
+                    
+                    model.params = fixed_params
+                    
+                    # Clear original params to free memory
+                    del params
+                    del fixed_params
+                    gc.collect()
+                    jax.clear_caches()
+                
+                logger.info("Testing forward pass with direct loaded weights...")
+                test_forward_pass(model, config, tokenizer)
+
+    if args.method in ["index", "all"]:
+        # Clear memory before next method
+        gc.collect()
+        jax.clear_caches()
+        
+        logger.info("=== Testing loading from index file ===")
+        model = test_direct_load_from_index(args.weights_dir, config, dtype)
+        if model is not None and args.test_forward:
+            logger.info("Testing forward pass with index loaded weights...")
+            test_forward_pass(model, config, tokenizer)
+
+    if args.method in ["model", "all"]:
+        # Clear memory before next method
+        gc.collect()
+        jax.clear_caches()
+        
+        logger.info("=== Testing load_model_and_weights function ===")
+        model = test_model_and_weights(args.weights_dir, config, dtype)
+        if model is not None and args.test_forward:
+            logger.info("Testing forward pass with model loaded weights...")
+            test_forward_pass(model, config, tokenizer)
+
+    logger.info("Weight loading tests completed.")
 
 
 if __name__ == "__main__":

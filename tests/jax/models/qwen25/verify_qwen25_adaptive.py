@@ -60,6 +60,7 @@ from typing import Dict, Any
 from jax.sharding import Mesh, PartitionSpec as P
 from flax.traverse_util import flatten_dict, unflatten_dict
 from safetensors import safe_open
+import re
 
 # Configure logging
 logging.basicConfig(
@@ -85,9 +86,11 @@ from tensor_parallel import (
     create_device_mesh,
     get_partition_specs,
     load_params_from_checkpoint,
+    map_parameter_paths,
 )
 from config import load_qwen_config, get_qwen2_7b_config
-from weight_loading import load_qwen_weights, load_partial_qwen_weights
+from weight_loading import load_qwen_weights, load_partial_qwen_weights, init_model_from_weights
+from weight_diagnostics import create_parameter_structure_report, fix_parameter_structure
 
 # Global variables for monitoring
 monitoring_active = False
@@ -113,6 +116,152 @@ class Colors:
 def colored(text, color):
     """Add color to terminal text."""
     return f"{color}{text}{Colors.ENDC}"
+
+# Memory tracking class for more proactive memory management
+class MemoryTracker:
+    """Memory tracker to monitor and manage memory usage during model operations."""
+    
+    def __init__(self, gc_threshold_mb=500, critical_threshold_mb=0, 
+                polling_interval=5, logger=None):
+        """
+        Initialize memory tracker.
+        
+        Args:
+            gc_threshold_mb: Memory increase threshold to trigger garbage collection (MB)
+            critical_threshold_mb: Critical memory threshold (MB, 0 for auto-detection)
+            polling_interval: Background polling interval in seconds
+            logger: Logger instance for output
+        """
+        self.last_tracked_memory = 0
+        self.gc_threshold_mb = gc_threshold_mb
+        self.critical_threshold_mb = critical_threshold_mb
+        self.memory_log = []
+        self.peak_memory = 0
+        self.logger = logger or logging.getLogger("memory-tracker")
+        self.tracking_active = False
+        self.tracking_thread = None
+        self.polling_interval = polling_interval
+        
+        # Auto-detect critical threshold if not set
+        if self.critical_threshold_mb <= 0:
+            system_memory = psutil.virtual_memory()
+            # Set critical threshold to 85% of system memory
+            self.critical_threshold_mb = int(system_memory.total / (1024 * 1024) * 0.85)
+            self.logger.info(f"Auto-detected critical memory threshold: {self.critical_threshold_mb} MB")
+    
+    def start_tracking(self):
+        """Start background memory tracking."""
+        if self.tracking_active:
+            return
+            
+        self.tracking_active = True
+        self.tracking_thread = threading.Thread(target=self._monitor_memory, daemon=True)
+        self.tracking_thread.start()
+        self.logger.info(f"Started memory tracking (GC threshold: {self.gc_threshold_mb} MB, "
+                        f"critical threshold: {self.critical_threshold_mb} MB)")
+    
+    def stop_tracking(self):
+        """Stop background memory tracking."""
+        if not self.tracking_active:
+            return
+            
+        self.tracking_active = False
+        if self.tracking_thread:
+            self.tracking_thread.join(timeout=1)
+            self.tracking_thread = None
+        
+        self.logger.info(f"Stopped memory tracking. Peak memory: {self.peak_memory:.1f} MB")
+        return self.memory_log
+    
+    def _monitor_memory(self):
+        """Background thread to monitor memory usage."""
+        while self.tracking_active:
+            try:
+                # Check current memory
+                current_memory = self._get_current_memory()
+                
+                # Update peak memory
+                if current_memory > self.peak_memory:
+                    self.peak_memory = current_memory
+                
+                # Check if we're approaching critical memory
+                if current_memory > self.critical_threshold_mb * 0.9:  # Within 90% of critical
+                    self.logger.warning(f"Memory usage nearing critical threshold: "
+                                      f"{current_memory:.1f} MB / {self.critical_threshold_mb} MB")
+                    # Force garbage collection
+                    collected = gc.collect()
+                    self.logger.info(f"Emergency garbage collection freed {collected} objects")
+                
+                # Add to log
+                self.memory_log.append((time.time(), current_memory))
+                
+                # Sleep for the polling interval
+                time.sleep(self.polling_interval)
+            except Exception as e:
+                self.logger.error(f"Error in memory monitoring: {e}")
+                time.sleep(self.polling_interval * 2)  # Sleep longer on error
+    
+    def _get_current_memory(self):
+        """Get current memory usage in MB."""
+        try:
+            process = psutil.Process(os.getpid())
+            memory_info = process.memory_info()
+            return memory_info.rss / (1024 * 1024)
+        except Exception:
+            return 0
+    
+    def check_memory(self, operation_name, force_gc=False):
+        """
+        Check current memory usage and optionally trigger garbage collection.
+        
+        Args:
+            operation_name: Name of the current operation for logging
+            force_gc: Whether to force garbage collection
+            
+        Returns:
+            Current memory usage in MB
+        """
+        # Get current memory usage
+        current_memory = self._get_current_memory()
+        
+        # Calculate memory delta since last check
+        memory_delta = current_memory - self.last_tracked_memory
+        
+        # Update peak memory
+        if current_memory > self.peak_memory:
+            self.peak_memory = current_memory
+        
+        # Log the memory check
+        self.memory_log.append((time.time(), operation_name, current_memory, memory_delta))
+        
+        # Check if we should run garbage collection
+        should_collect = force_gc or memory_delta > self.gc_threshold_mb
+        emergency_collect = current_memory > self.critical_threshold_mb
+        
+        if should_collect or emergency_collect:
+            gc_type = "Emergency" if emergency_collect else "Routine"
+            self.logger.info(f"{gc_type} garbage collection triggered during {operation_name} "
+                           f"(current: {current_memory:.1f} MB, delta: {memory_delta:+.1f} MB)")
+            
+            # Run garbage collection
+            gc_start = time.time()
+            collected = gc.collect(generation=2)  # Full collection
+            gc_time = time.time() - gc_start
+            
+            # Check memory after collection
+            new_memory = self._get_current_memory()
+            freed_mb = current_memory - new_memory
+            
+            self.logger.info(f"Garbage collection freed {freed_mb:.1f} MB ({collected} objects) "
+                           f"in {gc_time:.2f}s")
+            
+            # Update current memory
+            current_memory = new_memory
+        
+        # Update last tracked memory
+        self.last_tracked_memory = current_memory
+        
+        return current_memory
 
 def get_system_metrics():
     """Get current memory and CPU usage information."""
@@ -449,6 +598,90 @@ def estimate_max_model_size(system_memory_mb, target_usage_ratio=0.8):
     
     return available_parameters 
 
+def improved_memory_estimation(config, system_memory_mb, target_usage_ratio=0.8):
+    """
+    More accurate memory estimation based on model structure and scaling.
+    
+    Args:
+        config: Model configuration
+        system_memory_mb: Total system memory in MB
+        target_usage_ratio: Target memory usage ratio (0.0-1.0)
+        
+    Returns:
+        Dictionary with memory estimates
+    """
+    hidden_size = config.get("hidden_size", 4096)
+    num_layers = config.get("num_hidden_layers", 32)
+    vocab_size = config.get("vocab_size", 152064)
+    intermediate_size = config.get("intermediate_size", hidden_size * 4)
+    
+    # Base process memory requirements (more conservative estimate)
+    base_process_mb = 1000  # 1GB base process memory
+    
+    # Available memory for model
+    available_memory_mb = system_memory_mb * target_usage_ratio - base_process_mb
+    
+    # Calculate parameter memory
+    # Each parameter in BF16 is 2 bytes
+    parameter_bytes = calculate_model_size(hidden_size, num_layers, vocab_size, 
+                                         intermediate_size // hidden_size)["params"] * 2  # BF16
+    parameter_memory_mb = parameter_bytes / (1024 * 1024)
+    
+    # Calculate overhead with dynamic scaling based on model size
+    # Smaller models have relatively higher overhead
+    if hidden_size <= 1024:
+        # Small models have higher relative overhead
+        activation_overhead = 2.0  # 100% overhead
+        compilation_overhead = 0.3  # 30% additional for compilation
+    elif hidden_size <= 2048:
+        activation_overhead = 1.8  # 80% overhead
+        compilation_overhead = 0.25  # 25% additional for compilation
+    elif hidden_size <= 4096:
+        activation_overhead = 1.6  # 60% overhead
+        compilation_overhead = 0.2  # 20% additional for compilation
+    else:
+        activation_overhead = 1.5  # 50% overhead
+        compilation_overhead = 0.15  # 15% additional for compilation
+    
+    # Mesh operations add additional overhead for tensor parallelism
+    tensor_parallel_overhead = 0.1  # 10% additional overhead for tensor parallelism
+    
+    # Activation memory
+    activation_memory_mb = parameter_memory_mb * activation_overhead
+    
+    # Compilation memory spike
+    compilation_spike_mb = parameter_memory_mb * compilation_overhead
+    
+    # Tensor parallelism overhead
+    tensor_parallel_mb = parameter_memory_mb * tensor_parallel_overhead
+    
+    # Total memory estimate
+    total_estimated_mb = parameter_memory_mb + activation_memory_mb + compilation_spike_mb + tensor_parallel_mb
+    
+    # Peak memory estimate (during weight loading and compilation)
+    peak_memory_mb = total_estimated_mb * 1.1  # Add 10% safety margin for peak usage
+    
+    # Check if we have enough memory
+    has_enough_memory = peak_memory_mb < available_memory_mb
+    
+    # Calculate the maximum possible scaling factor
+    max_scaling_factor = (available_memory_mb / peak_memory_mb) ** 0.5 if peak_memory_mb > 0 else 0
+    
+    # Apply a safety margin to the scaling factor
+    safe_scaling_factor = max_scaling_factor * 0.9  # 10% safety margin
+    
+    return {
+        "parameter_memory_mb": parameter_memory_mb,
+        "activation_memory_mb": activation_memory_mb,
+        "compilation_spike_mb": compilation_spike_mb,
+        "tensor_parallel_mb": tensor_parallel_mb,
+        "total_estimated_mb": total_estimated_mb,
+        "peak_memory_mb": peak_memory_mb,
+        "available_memory_mb": available_memory_mb,
+        "has_enough_memory": has_enough_memory,
+        "max_scaling_factor": safe_scaling_factor,
+    }
+
 def improve_load_partial_qwen_weights(model_path, target_params, config, mesh, num_layers=None, logger=None):
     """
     Improved version of partial weight loading with reduced logging and better tensor resizing.
@@ -471,6 +704,7 @@ def improve_load_partial_qwen_weights(model_path, target_params, config, mesh, n
     import jax
     import jax.numpy as jnp
     from flax.traverse_util import flatten_dict, unflatten_dict
+    from flax.core.frozen_dict import freeze, unfreeze
     
     # Simple logging function if no logger provided
     def log_info(msg, verbose_only=False):
@@ -518,23 +752,206 @@ def improve_load_partial_qwen_weights(model_path, target_params, config, mesh, n
     target_hidden_size = config["hidden_size"]
     target_layers = config["num_hidden_layers"]
     
-    # Simple weight adaptation method
+    # More robust tensor resizing with SVD for weight matrices
     def resize_tensor(tensor, target_shape):
-        """Resize tensor to target shape by simple truncation"""
+        """Resize tensor to target shape with better quality for weight matrices"""
         if tensor.shape == target_shape:
             return tensor
             
         if len(tensor.shape) != len(target_shape):
             log_info(f"Incompatible shapes for resizing: {tensor.shape} vs {target_shape}", verbose_only=True)
-            return tensor
+            return np.zeros(target_shape, dtype=tensor.dtype)
+        
+        # Special handling for 2D weight matrices (use SVD for important dimensions)
+        if len(tensor.shape) == 2:
+            src_rows, src_cols = tensor.shape
+            tgt_rows, tgt_cols = target_shape
             
-        # Simple truncation for each dimension
-        slices = tuple(slice(0, min(s, t)) for s, t in zip(tensor.shape, target_shape))
+            # Memory-efficient approach for large matrices
+            # Lower threshold from 10000 to 5000 to avoid memory issues
+            if src_rows > 5000 or src_cols > 5000:
+                # Use chunked SVD approach for very large matrices
+                return chunked_matrix_resize(tensor, target_shape)
+            else:
+                try:
+                    # For smaller matrices, use SVD for better quality
+                    # Free memory before SVD calculation
+                    gc.collect()
+                    
+                    # Compute SVD of the source matrix
+                    try:
+                        u, s, vh = np.linalg.svd(tensor, full_matrices=False)
+                        
+                        # Determine rank to keep
+                        k = min(len(s), tgt_rows, tgt_cols)
+                        
+                        # Resize u, s, vh
+                        u_resized = np.zeros((tgt_rows, k), dtype=u.dtype)
+                        vh_resized = np.zeros((k, tgt_cols), dtype=vh.dtype)
+                        
+                        # Copy values
+                        u_resized[:min(src_rows, tgt_rows), :k] = u[:min(src_rows, tgt_rows), :k]
+                        vh_resized[:k, :min(src_cols, tgt_cols)] = vh[:k, :min(src_cols, tgt_cols)]
+                        
+                        # Clear original matrices to free memory
+                        del u, s 
+                        
+                        # Reconstruct the matrix in chunks to save memory
+                        tensor_resized = np.zeros(target_shape, dtype=tensor.dtype)
+                        
+                        # Process in smaller chunks to reduce peak memory
+                        chunk_size = 1000
+                        for i in range(0, tgt_rows, chunk_size):
+                            end_i = min(i + chunk_size, tgt_rows)
+                            tensor_resized[i:end_i, :] = np.matmul(
+                                u_resized[i:end_i, :] * s[:k], 
+                                vh_resized
+                            )
+                            
+                        # Free temp variables
+                        del u_resized, vh_resized
+                        gc.collect()
+                        
+                        return tensor_resized.astype(tensor.dtype)
+                        
+                    except np.linalg.LinAlgError:
+                        # Fallback to truncation if SVD fails
+                        log_info(f"SVD failed, falling back to truncation for {tensor.shape} -> {target_shape}", verbose_only=True)
+                        return simple_truncation_resize(tensor, target_shape)
+                except Exception as e:
+                    log_info(f"Error during SVD resizing: {e}, falling back to simple resizing", verbose_only=True)
+                    # Fallback to simple resizing
+                    return simple_truncation_resize(tensor, target_shape)
+        
+        # For non-2D tensors, use simple truncation/padding
+        return simple_truncation_resize(tensor, target_shape)
+    
+    def chunked_matrix_resize(tensor, target_shape):
+        """Memory-efficient matrix resizing for very large matrices using chunking"""
+        src_rows, src_cols = tensor.shape
+        tgt_rows, tgt_cols = target_shape
+        
+        # Pre-allocate result
         tensor_resized = np.zeros(target_shape, dtype=tensor.dtype)
+        
+        # For very large matrices, process in smaller chunks
+        max_chunk_size = 3000  # Reduced from 5000 to be even more memory-efficient
+        
+        # Determine if we should chunk by rows, columns, or both
+        chunk_rows = src_rows > max_chunk_size
+        chunk_cols = src_cols > max_chunk_size
+        
+        # If only one dimension is large, chunk along that dimension
+        if chunk_rows and not chunk_cols:
+            log_info(f"Chunking large matrix ({src_rows}x{src_cols}) by rows", verbose_only=True)
+            
+            # Calculate chunk sizes
+            num_chunks = (src_rows + max_chunk_size - 1) // max_chunk_size
+            
+            for i in range(num_chunks):
+                # Calculate chunk boundaries
+                start_row = i * max_chunk_size
+                end_row = min(src_rows, (i + 1) * max_chunk_size)
+                target_end_row = min(tgt_rows, end_row)
+                
+                if start_row >= tgt_rows:
+                    break  # Beyond target size
+                
+                # Extract and process chunk
+                chunk = tensor[start_row:end_row, :]
+                
+                # Resize chunk to target width but keep same height
+                chunk_target_shape = (end_row - start_row, tgt_cols)
+                if chunk.shape[1] != tgt_cols:
+                    # Use simple truncation for the row chunks
+                    chunk_resized = simple_truncation_resize(chunk, chunk_target_shape)
+                else:
+                    chunk_resized = chunk
+                
+                # Copy to result tensor
+                tensor_resized[start_row:target_end_row, :] = chunk_resized[:target_end_row-start_row, :]
+                
+                # Force garbage collection after processing each chunk
+                del chunk, chunk_resized
+                gc.collect()
+                
+        # If columns need chunking
+        elif chunk_cols and not chunk_rows:
+            log_info(f"Chunking large matrix ({src_rows}x{src_cols}) by columns", verbose_only=True)
+            
+            # Calculate chunk sizes
+            num_chunks = (src_cols + max_chunk_size - 1) // max_chunk_size
+            
+            for i in range(num_chunks):
+                # Calculate chunk boundaries
+                start_col = i * max_chunk_size
+                end_col = min(src_cols, (i + 1) * max_chunk_size)
+                target_end_col = min(tgt_cols, end_col)
+                
+                if start_col >= tgt_cols:
+                    break  # Beyond target size
+                
+                # Extract and process chunk
+                chunk = tensor[:, start_col:end_col]
+                
+                # Resize chunk to target height but keep same width
+                chunk_target_shape = (tgt_rows, end_col - start_col)
+                if chunk.shape[0] != tgt_rows:
+                    # Use simple truncation for the column chunks
+                    chunk_resized = simple_truncation_resize(chunk, chunk_target_shape)
+                else:
+                    chunk_resized = chunk
+                
+                # Copy to result tensor
+                tensor_resized[:, start_col:target_end_col] = chunk_resized[:, :target_end_col-start_col]
+                
+                # Force garbage collection after processing each chunk
+                del chunk, chunk_resized
+                gc.collect()
+                
+        # If both dimensions are large, use a simple approach to avoid excessive chunking
+        else:
+            log_info(f"Matrix too large in both dimensions ({src_rows}x{src_cols}), using simple resize", verbose_only=True)
+            tensor_resized = simple_truncation_resize(tensor, target_shape)
+        
+        return tensor_resized
+    
+    def simple_truncation_resize(tensor, target_shape):
+        """Simple resize by truncation or padding"""
+        tensor_resized = np.zeros(target_shape, dtype=tensor.dtype)
+        slices = tuple(slice(0, min(s, t)) for s, t in zip(tensor.shape, target_shape))
         tensor_view = tensor[slices]
         target_slices = tuple(slice(0, s.stop) for s in slices)
         tensor_resized[target_slices] = tensor_view
         return tensor_resized
+    
+    # Create parameter name mapping dictionary
+    param_name_mappings = {
+        # Embedding mappings
+        "model.embed_tokens.weight": ["transformer.embed_tokens.embedding", "model.embed_tokens.weight", "params.transformer.embed_tokens.weight"],
+        
+        # Attention mappings
+        "model.layers.{}.self_attn.q_proj.weight": ["transformer.h.{}.attn.q.kernel", "model.layers.{}.self_attn.q_proj.kernel", "params.transformer.layers_{}.self_attn.q_proj.kernel"],
+        "model.layers.{}.self_attn.k_proj.weight": ["transformer.h.{}.attn.k.kernel", "model.layers.{}.self_attn.k_proj.kernel", "params.transformer.layers_{}.self_attn.k_proj.kernel"],
+        "model.layers.{}.self_attn.v_proj.weight": ["transformer.h.{}.attn.v.kernel", "model.layers.{}.self_attn.v_proj.kernel", "params.transformer.layers_{}.self_attn.v_proj.kernel"],
+        "model.layers.{}.self_attn.o_proj.weight": ["transformer.h.{}.attn.o.kernel", "model.layers.{}.self_attn.o_proj.kernel", "params.transformer.layers_{}.self_attn.o_proj.kernel"],
+        
+        # MLP mappings
+        "model.layers.{}.mlp.gate_proj.weight": ["transformer.h.{}.mlp.w1.kernel", "model.layers.{}.mlp.gate_proj.kernel", "params.transformer.layers_{}.mlp.gate_proj.kernel"],
+        "model.layers.{}.mlp.up_proj.weight": ["transformer.h.{}.mlp.w2.kernel", "model.layers.{}.mlp.up_proj.kernel", "params.transformer.layers_{}.mlp.up_proj.kernel"],
+        "model.layers.{}.mlp.down_proj.weight": ["transformer.h.{}.mlp.w3.kernel", "model.layers.{}.mlp.down_proj.kernel", "params.transformer.layers_{}.mlp.down_proj.kernel"],
+        
+        # Layernorm mappings
+        "model.layers.{}.input_layernorm.weight": ["transformer.h.{}.ln_1.weight", "model.layers.{}.input_layernorm.weight", "params.transformer.layers_{}.input_layernorm.weight"],
+        "model.layers.{}.post_attention_layernorm.weight": ["transformer.h.{}.ln_2.weight", "model.layers.{}.post_attention_layernorm.weight", "params.transformer.layers_{}.post_attention_layernorm.weight"],
+        
+        # Final layernorm and lm_head
+        "model.norm.weight": ["transformer.ln_f.weight", "model.norm.weight", "params.transformer.norm.weight"],
+        "lm_head.weight": ["lm_head.weight", "model.lm_head.weight", "params.lm_head.weight"],
+    }
+    
+    # For flattened parameter path lookup
+    flat_target_params = flatten_dict(new_params)
     
     # Track statistics
     total_weights = 0
@@ -561,82 +978,156 @@ def improve_load_partial_qwen_weights(model_path, target_params, config, mesh, n
                             layer_num = int(layer_parts[0])
                             # Skip layers beyond our target layer count
                             if layer_num >= target_layers:
+                                log_info(f"Skipping {key} (layer {layer_num} > target {target_layers})", verbose_only=True)
                                 continue
                         except ValueError:
                             pass
                 
-                # Try to find the corresponding key in our target params
+                # Get the tensor
                 tensor = f.get_tensor(key)
-                param_key = key
                 
-                # Convert PyTorch key format to JAX format
-                param_key = param_key.replace("model.layers", "transformer.h")
-                param_key = param_key.replace("self_attn", "attn")
-                param_key = param_key.replace("q_proj", "q")
-                param_key = param_key.replace("k_proj", "k")
-                param_key = param_key.replace("v_proj", "v")
-                param_key = param_key.replace("o_proj", "o")
-                param_key = param_key.replace("mlp.gate_proj", "mlp.w1")
-                param_key = param_key.replace("mlp.up_proj", "mlp.w2")
-                param_key = param_key.replace("mlp.down_proj", "mlp.w3")
-                param_key = param_key.replace("input_layernorm", "ln_1")
-                param_key = param_key.replace("post_attention_layernorm", "ln_2")
-                param_key = param_key.replace("model.norm", "transformer.ln_f")
+                # Try different parameter name mappings
+                found = False
                 
-                # Handle embedding conversion
-                if "embed_tokens.weight" in param_key:
-                    param_key = "transformer.embed_tokens.embedding"
-                
-                # For kernel/weight conversion
-                if param_key.endswith(".weight") and not param_key.endswith("ln_1.weight") and not param_key.endswith("ln_2.weight") and not param_key.endswith("ln_f.weight"):
-                    param_key = param_key.replace(".weight", ".kernel")
-                
-                # Handle different paths in the params tree
-                param_path = param_key.split(".")
-                
-                # Try to find the tensor location in our parameter tree
-                current = new_params
-                found = True
-                
-                for i, part in enumerate(param_path):
-                    if part in current:
-                        if i == len(param_path) - 1:  # Last part
-                            # Found the target - now resize if needed
-                            target_shape = current[part].shape
-                            if tensor.shape != target_shape:
-                                log_info(f"Resizing {param_key}: {tensor.shape} -> {target_shape}", verbose_only=True)
-                                resized_weights += 1
+                # Check for layer-specific parameter
+                if ".layers." in key:
+                    # Extract layer number for formatting
+                    layer_match = re.search(r"\.layers\.(\d+)\.", key)
+                    if layer_match:
+                        layer_idx = int(layer_match.group(1))
+                        
+                        # Generate template key without layer number
+                        template_key = key.replace(f".layers.{layer_idx}.", ".layers.{}.")
+                        
+                        # Check if we have a mapping for this template
+                        if template_key in param_name_mappings:
+                            # Try each possible target mapping with the layer number filled in
+                            for target_template in param_name_mappings[template_key]:
+                                target_key = target_template.format(layer_idx)
                                 
-                                # Use simple resizing approach
-                                tensor = resize_tensor(tensor, target_shape)
-                            
-                            # Convert to the right dtype
-                            try:
-                                tensor = jnp.array(tensor, dtype=current[part].dtype)
+                                # Convert to path components
+                                target_path = target_key.split(".")
                                 
-                                # Apply the correct partitioning spec
-                                if hasattr(current[part], "sharding"):
-                                    sharding = current[part].sharding
-                                    tensor = jax.device_put(tensor, sharding)
+                                # Navigate to parameter location
+                                current = new_params
+                                path_found = True
+                                for i, part in enumerate(target_path):
+                                    if part in current:
+                                        if i == len(target_path) - 1:  # Last part
+                                            # Found the target - now resize if needed
+                                            target_shape = current[part].shape
+                                            if tensor.shape != target_shape:
+                                                log_info(f"Resizing {key} -> {target_key}: {tensor.shape} -> {target_shape}", verbose_only=True)
+                                                resized_weights += 1
+                                                
+                                                # Use improved resizing
+                                                tensor = resize_tensor(tensor, target_shape)
+                                            
+                                            # Convert to the right dtype
+                                            try:
+                                                tensor = jnp.array(tensor, dtype=current[part].dtype)
+                                                
+                                                # Apply the correct partitioning spec
+                                                if hasattr(current[part], "sharding"):
+                                                    sharding = current[part].sharding
+                                                    tensor = jax.device_put(tensor, sharding)
+                                                
+                                                # Update the parameter
+                                                current[part] = tensor
+                                                loaded_weights += 1
+                                                log_info(f"Loaded {key} -> {target_key}", verbose_only=True)
+                                                break  # Break out of the target_template loop
+                                            except Exception as e:
+                                                log_info(f"Error setting {target_key}: {e}", verbose_only=True)
+                                        else:
+                                            current = current[part]
+                                    else:
+                                        path_found = False
+                                        break
                                 
-                                # Update the parameter
-                                current[part] = tensor
-                                loaded_weights += 1
-                                log_info(f"Loaded {param_key}", verbose_only=True)
-                            except Exception as e:
-                                log_info(f"Error setting {param_key}: {e}", verbose_only=True)
-                        else:
-                            current = current[part]
-                    else:
-                        found = False
-                        break
+                                if found:
+                                    break  # Break out of the target_template loop if we found a match
                 
+                # Non-layer specific parameters (embedding, final norm, lm_head)
                 if not found:
-                    # Try with params prefix
-                    param_key = "params." + param_key
+                    # Check simple key as-is
+                    if key in param_name_mappings:
+                        for target_key in param_name_mappings[key]:
+                            target_path = target_key.split(".")
+                            
+                            # Navigate to parameter location
+                            current = new_params
+                            path_found = True
+                            for i, part in enumerate(target_path):
+                                if part in current:
+                                    if i == len(target_path) - 1:  # Last part
+                                        # Found the target - now resize if needed
+                                        target_shape = current[part].shape
+                                        if tensor.shape != target_shape:
+                                            log_info(f"Resizing {key} -> {target_key}: {tensor.shape} -> {target_shape}", verbose_only=True)
+                                            resized_weights += 1
+                                            
+                                            # Use improved resizing
+                                            tensor = resize_tensor(tensor, target_shape)
+                                        
+                                        # Convert to the right dtype
+                                        try:
+                                            tensor = jnp.array(tensor, dtype=current[part].dtype)
+                                            
+                                            # Apply the correct partitioning spec
+                                            if hasattr(current[part], "sharding"):
+                                                sharding = current[part].sharding
+                                                tensor = jax.device_put(tensor, sharding)
+                                            
+                                            # Update the parameter
+                                            current[part] = tensor
+                                            loaded_weights += 1
+                                            log_info(f"Loaded {key} -> {target_key}", verbose_only=True)
+                                            break  # Break out of the target_key loop
+                                        except Exception as e:
+                                            log_info(f"Error setting {target_key}: {e}", verbose_only=True)
+                                    else:
+                                        current = current[part]
+                                else:
+                                    path_found = False
+                                    break
+                            
+                            if found:
+                                break  # Break out of the target_key loop if we found a match
+                
+                # Original parameter name conversion and lookup logic (as fallback)
+                if not found:
+                    # Try to find the corresponding key in our target params
+                    param_key = key
+                    
+                    # Convert PyTorch key format to JAX format
+                    param_key = param_key.replace("model.layers", "transformer.h")
+                    param_key = param_key.replace("self_attn", "attn")
+                    param_key = param_key.replace("q_proj", "q")
+                    param_key = param_key.replace("k_proj", "k")
+                    param_key = param_key.replace("v_proj", "v")
+                    param_key = param_key.replace("o_proj", "o")
+                    param_key = param_key.replace("mlp.gate_proj", "mlp.w1")
+                    param_key = param_key.replace("mlp.up_proj", "mlp.w2")
+                    param_key = param_key.replace("mlp.down_proj", "mlp.w3")
+                    param_key = param_key.replace("input_layernorm", "ln_1")
+                    param_key = param_key.replace("post_attention_layernorm", "ln_2")
+                    param_key = param_key.replace("model.norm", "transformer.ln_f")
+                    
+                    # Handle embedding conversion
+                    if "embed_tokens.weight" in param_key:
+                        param_key = "transformer.embed_tokens.embedding"
+                    
+                    # For kernel/weight conversion
+                    if param_key.endswith(".weight") and not param_key.endswith("ln_1.weight") and not param_key.endswith("ln_2.weight") and not param_key.endswith("ln_f.weight"):
+                        param_key = param_key.replace(".weight", ".kernel")
+                    
+                    # Handle different paths in the params tree
                     param_path = param_key.split(".")
+                    
+                    # Try to find the tensor location in our parameter tree
                     current = new_params
-                    found = True
+                    path_found = True
                     
                     for i, part in enumerate(param_path):
                         if part in current:
@@ -644,10 +1135,10 @@ def improve_load_partial_qwen_weights(model_path, target_params, config, mesh, n
                                 # Found the target - now resize if needed
                                 target_shape = current[part].shape
                                 if tensor.shape != target_shape:
-                                    log_info(f"Resizing {param_key}: {tensor.shape} -> {target_shape}", verbose_only=True)
+                                    log_info(f"Resizing {key} -> {param_key}: {tensor.shape} -> {target_shape}", verbose_only=True)
                                     resized_weights += 1
                                     
-                                    # Use simple resizing approach
+                                    # Use improved resizing
                                     tensor = resize_tensor(tensor, target_shape)
                                 
                                 # Convert to the right dtype
@@ -662,18 +1153,21 @@ def improve_load_partial_qwen_weights(model_path, target_params, config, mesh, n
                                     # Update the parameter
                                     current[part] = tensor
                                     loaded_weights += 1
-                                    log_info(f"Loaded {param_key}", verbose_only=True)
+                                    log_info(f"Loaded {key} -> {param_key}", verbose_only=True)
+                                    found = True
                                 except Exception as e:
                                     log_info(f"Error setting {param_key}: {e}", verbose_only=True)
                             else:
                                 current = current[part]
                         else:
-                            found = False
+                            path_found = False
                             break
-                    
-                    if not found:
-                        log_info(f"Key {key} not found in target params", verbose_only=True)
-                        not_found_weights += 1
+                
+                # Try with params prefix
+                if not found:
+                    # This is already handled in the mappings above
+                    not_found_weights += 1
+                    log_info(f"Could not find parameter mapping for {key}", verbose_only=True)
     
     # Summary stats
     log_info(f"Weight loading summary:")
@@ -681,6 +1175,21 @@ def improve_load_partial_qwen_weights(model_path, target_params, config, mesh, n
     log_info(f"  Weights loaded successfully: {loaded_weights}")
     log_info(f"  Weights that required resizing: {resized_weights}")
     log_info(f"  Weights not found in target model: {not_found_weights}")
+    
+    # Apply our parameter mapping fix
+    try:
+        from tensor_parallel import map_parameter_paths
+        from weight_diagnostics import fix_parameter_structure
+        
+        # Make a final pass to ensure parameter paths are correctly mapped
+        log_info("Applying parameter path mapping...")
+        new_params = map_parameter_paths(new_params)
+        
+        # Fix any remaining structure issues
+        log_info("Applying parameter structure fixes...")
+        new_params = fix_parameter_structure(new_params)
+    except Exception as e:
+        log_info(f"Error applying parameter fixes: {e}")
     
     return new_params
 
@@ -731,7 +1240,17 @@ def verify_adaptive_model(
     logger.info(colored(f"QWEN 2.5 ADAPTIVE MODEL VERIFICATION (1x8 Tensor Parallel)", Colors.BOLD + Colors.HEADER))
     logger.info(colored(f"{'='*80}", Colors.BOLD))
     
-    # Start background resource monitoring
+    # Create a memory tracker instance for this run
+    memory_tracker = MemoryTracker(
+        gc_threshold_mb=500,
+        logger=logger,
+        polling_interval=monitor_interval
+    )
+    
+    # Start background memory tracking
+    memory_tracker.start_tracking()
+    
+    # Start legacy monitoring for compatibility
     start_background_monitoring(monitor_interval)
     
     # Log initial metrics
@@ -772,35 +1291,35 @@ def verify_adaptive_model(
         if auto_scale:
             logger.info(colored("\n[2/7] Auto-scaling model to fit available RAM...", Colors.BOLD))
             
-            # Calculate available parameters for the target RAM usage
-            available_params = estimate_max_model_size(system_memory_mb, target_ram_percent / 100.0)
+            # Use our improved adaptive scaling algorithm
+            hidden_ratio, layers_ratio, scaling_successful = adaptive_scaling_algorithm(
+                original_config,
+                system_memory_mb,
+                starting_ratio=0.5,
+                max_iterations=5,
+                target_usage_ratio=target_ram_percent / 100.0,
+                logger=logger
+            )
             
-            # Calculate a balanced scaling factor
-            scaling_factor = (available_params / orig_size_info['params']) ** 0.5
+            if not scaling_successful:
+                logger.warning(colored("Adaptive scaling algorithm encountered issues. "
+                                      "Proceeding with conservative scaling.", Colors.YELLOW))
             
-            # Apply a safety margin to avoid out-of-memory errors
-            scaling_factor = scaling_factor * 0.9
+            logger.info(colored(f"Auto-scaling results:", Colors.YELLOW))
+            logger.info(colored(f"  Hidden size ratio: {hidden_ratio:.3f}", Colors.CYAN))
+            logger.info(colored(f"  Layers ratio: {layers_ratio:.3f}", Colors.CYAN))
             
-            # Limit to a maximum of 1.0
-            scaling_factor = min(1.0, scaling_factor)
-            
-            logger.info(f"Available RAM: {system_memory_mb:.1f} MB, target usage: {target_ram_percent:.1f}%")
-            logger.info(f"Estimated maximum parameters: {available_params:,.0f}")
-            logger.info(colored(f"Auto-scaling factor: {scaling_factor:.3f}", Colors.YELLOW))
-            
-            # Use slightly more hidden_size than layers for better quality
-            # But keep it simple and balanced
-            hidden_ratio = min(1.0, scaling_factor * 1.1)  # 10% more for hidden size
-            layers_ratio = min(1.0, scaling_factor * 0.9)  # 10% less for layers
-            
-            logger.info(colored(f"Hidden size ratio: {hidden_ratio:.3f}", Colors.CYAN))
-            logger.info(colored(f"Layers ratio: {layers_ratio:.3f}", Colors.CYAN))
+            # Mark that scaling has been applied
+            scaling_applied = True
             
         elif scale_ratio is not None:
             # Use the same ratio for both dimensions
             hidden_ratio = scale_ratio
             layers_ratio = scale_ratio
             logger.info(colored(f"\n[2/7] Using uniform scaling ratio: {scale_ratio:.3f}", Colors.BOLD))
+            
+            # Mark that scaling has been applied if not using full model
+            scaling_applied = scale_ratio < 1.0
             
         else:
             # Use the specified ratios or defaults
@@ -812,6 +1331,9 @@ def verify_adaptive_model(
             logger.info(colored(f"\n[2/7] Using custom scaling ratios:", Colors.BOLD))
             logger.info(f"  Hidden size ratio: {hidden_ratio:.3f}")
             logger.info(f"  Layers ratio: {layers_ratio:.3f}")
+            
+            # Mark that scaling has been applied if not using full model
+            scaling_applied = hidden_ratio < 1.0 or layers_ratio < 1.0
         
         # Create scaled configuration
         config, size_info = create_scaled_config(
@@ -827,8 +1349,15 @@ def verify_adaptive_model(
         logger.info(colored(f"  KV heads: {config['num_key_value_heads']}", Colors.GREEN))
         logger.info(colored(f"  Intermediate size: {config['intermediate_size']}", Colors.GREEN))
         
-        # Print memory estimates
-        expected_memory_mb = size_info['total_memory_mb']
+        # Use improved memory estimation
+        memory_estimate = improved_memory_estimation(
+            config, 
+            system_memory_mb,
+            target_ram_percent / 100.0
+        )
+        
+        # Print detailed memory estimates with color coding
+        expected_memory_mb = memory_estimate["total_estimated_mb"]
         expected_memory_ratio = expected_memory_mb / system_memory_mb * 100
         
         memory_color = Colors.GREEN
@@ -840,12 +1369,23 @@ def verify_adaptive_model(
         logger.info(f"Scaled model has {size_info['params']:,} parameters ({size_info['params']/orig_size_info['params']:.1%} of original)")
         logger.info(colored(f"Expected memory usage: ~{expected_memory_mb:,.1f} MB ({expected_memory_ratio:.1f}% of system RAM)", memory_color))
         
+        # Show detailed memory breakdown if verbose
+        if verbose:
+            logger.info(colored("Memory breakdown:", Colors.BOLD))
+            logger.info(f"  Parameter memory: {memory_estimate['parameter_memory_mb']:.1f} MB")
+            logger.info(f"  Activation memory: {memory_estimate['activation_memory_mb']:.1f} MB")
+            logger.info(f"  Compilation overhead: {memory_estimate['compilation_spike_mb']:.1f} MB")
+            logger.info(f"  Tensor parallelism overhead: {memory_estimate['tensor_parallel_mb']:.1f} MB")
+            logger.info(f"  Peak memory (projected): {memory_estimate['peak_memory_mb']:.1f} MB")
+        
         # Create the mesh
         logger.info(colored(f"\n[4/7] Creating device mesh with shape {mesh_shape}...", Colors.BOLD))
+        memory_tracker.check_memory("Before mesh creation")
         mesh = create_device_mesh(mesh_shape)
         logger.info(colored("✅ Mesh created successfully", Colors.GREEN))
         
         # Log metrics after mesh creation
+        memory_tracker.check_memory("After mesh creation")
         if not quiet:
             log_system_metrics("After mesh creation") if verbose else None
         
@@ -865,6 +1405,7 @@ def verify_adaptive_model(
         input_ids = jnp.ones((batch_size, 16), dtype=jnp.int32)
         
         # Log metrics before parameter initialization
+        memory_tracker.check_memory("Before parameter initialization", force_gc=True)
         if not quiet:
             log_system_metrics("Before parameter initialization")
         
@@ -872,11 +1413,20 @@ def verify_adaptive_model(
         with mesh:
             if use_demo_model:
                 # Generate a random key for initialization
-                rng = jax.random.PRNGKey(0)
-                
-                # Initialize with random weights
+                memory_tracker.check_memory("Before random weight initialization")
                 logger.info("Initializing model with random weights...")
-                params = model.init(rng, input_ids=input_ids)
+                
+                # Use staged initialization for better memory efficiency
+                params = staged_model_initialization(
+                    model_class=TensorParallelQwen2ForCausalLM,
+                    config=config,
+                    mesh=mesh,
+                    dtype=jnp.bfloat16,
+                    param_dtype=jnp.bfloat16,
+                    batch_size=batch_size,
+                    logger=logger
+                )
+                
                 logger.info(colored(f"✅ Model initialized with random weights in {time.time() - start_time:.2f} seconds", Colors.GREEN))
             else:
                 try:
@@ -886,10 +1436,21 @@ def verify_adaptive_model(
                     # Handle scaled models with real weights
                     if scaling_applied:
                         logger.info(colored("Using partial weight loading for scaled model", Colors.CYAN))
+                        memory_tracker.check_memory("Before partial weight initialization")
                         
                         # First initialize with random weights to get the parameter structure
-                        rng = jax.random.PRNGKey(0)
-                        params = model.init(rng, input_ids=input_ids)
+                        # Use staged initialization for better memory efficiency
+                        params = staged_model_initialization(
+                            model_class=TensorParallelQwen2ForCausalLM,
+                            config=config,
+                            mesh=mesh,
+                            dtype=jnp.bfloat16,
+                            param_dtype=jnp.bfloat16,
+                            batch_size=batch_size,
+                            logger=logger
+                        )
+                        
+                        memory_tracker.check_memory("After parameter structure initialization")
                         
                         # Use our improved loading function
                         params = improve_load_partial_qwen_weights(
@@ -903,9 +1464,52 @@ def verify_adaptive_model(
                         logger.info(colored(f"✅ Partial weights loaded successfully in {time.time() - start_time:.2f} seconds", Colors.GREEN))
                     else:
                         # For full-sized model, use the model's built-in weight loading
-                        logger.info(colored("Using direct checkpoint loading for full-sized model", Colors.CYAN))
-                        params = load_params_from_checkpoint(model, model_path)
-                        logger.info(colored(f"✅ Model weights loaded in {time.time() - start_time:.2f} seconds", Colors.GREEN))
+                        try:
+                            logger.info(colored("Using direct checkpoint loading for full-sized model", Colors.CYAN))
+                            # Import parameter mapping utilities
+                            from tensor_parallel import load_params_from_checkpoint, map_parameter_paths
+                            from weight_diagnostics import create_parameter_structure_report, fix_parameter_structure
+                            
+                            # Load parameters using our improved loading function
+                            params = load_params_from_checkpoint(model, model_path)
+                            
+                            # Apply parameter path mapping to ensure compatibility
+                            logger.info("Applying parameter path mapping...")
+                            params = map_parameter_paths(params)
+                            
+                            # Run diagnostics on the loaded parameters
+                            logger.info("Diagnosing parameter structure...")
+                            parameter_report = create_parameter_structure_report(params)
+                            
+                            # Apply fixes if needed
+                            if parameter_report["recommendations"]:
+                                logger.info(f"Found {len(parameter_report['recommendations'])} parameter structure issues:")
+                                for i, rec in enumerate(parameter_report["recommendations"]):
+                                    logger.info(f"  {i+1}. {rec}")
+                                logger.info("Applying parameter structure fixes...")
+                                params = fix_parameter_structure(params)
+                            else:
+                                logger.info("Parameter structure looks good!")
+                                
+                            logger.info(colored(f"✅ Model weights loaded in {time.time() - start_time:.2f} seconds", Colors.GREEN))
+                        except Exception as e:
+                            logger.error(colored(f"Error in standard loading: {e}", Colors.RED))
+                            
+                            # Try fallback loading method
+                            logger.info(colored("Trying fallback loading method...", Colors.YELLOW))
+                            try:
+                                from weight_loading import init_model_from_weights
+                                model, params = init_model_from_weights(
+                                    model_class=TensorParallelQwen2ForCausalLM,
+                                    model_path=model_path,
+                                    config=config,
+                                    mesh=mesh,
+                                    param_dtype=jnp.bfloat16
+                                )
+                                logger.info(colored(f"✅ Fallback loading successful in {time.time() - start_time:.2f} seconds", Colors.GREEN))
+                            except Exception as e2:
+                                logger.error(colored(f"❌ Fallback loading failed: {e2}", Colors.RED))
+                                raise ValueError(f"Failed to load weights: {e2}")
                         
                 except Exception as e:
                     logger.error(colored(f"❌ Error loading weights: {e}", Colors.RED))
@@ -1255,6 +1859,335 @@ def disable_shape_debug_logs():
             logger.info("Shape debug logging has been disabled (direct approach)")
         except Exception as e2:
             logger.warning(f"Could not disable shape debug logs: {e2}")
+
+def adaptive_scaling_algorithm(original_config, system_memory_mb, 
+                              starting_ratio=0.5, max_iterations=5,
+                              target_usage_ratio=0.8, logger=None):
+    """
+    Find the optimal model scale through intelligent binary search.
+    
+    Args:
+        original_config: Original model configuration
+        system_memory_mb: Available system memory in MB
+        starting_ratio: Initial scaling ratio to try (0.0-1.0)
+        max_iterations: Maximum number of iterations
+        target_usage_ratio: Target memory usage ratio (0.0-1.0)
+        logger: Logger for output
+        
+    Returns:
+        Tuple of (hidden_ratio, layers_ratio, is_successful)
+    """
+    if logger is None:
+        logger = logging.getLogger("adaptive-scaling")
+    
+    lower_bound = 0.1  # Minimum scale ratio
+    upper_bound = 1.0  # Maximum scale ratio
+    current_ratio = starting_ratio
+    
+    best_ratio = None
+    best_memory_efficiency = 0
+    
+    logger.info(f"Starting adaptive scaling search (max iterations: {max_iterations})")
+    
+    for i in range(max_iterations):
+        logger.info(f"Iteration {i+1}/{max_iterations}: Testing scale ratio {current_ratio:.3f}")
+        
+        # Configure model with current ratio
+        test_config, _ = create_scaled_config(
+            original_config,
+            hidden_ratio=current_ratio,
+            layers_ratio=current_ratio
+        )
+        
+        # Run memory estimation
+        memory_estimate = improved_memory_estimation(
+            test_config, 
+            system_memory_mb,
+            target_usage_ratio
+        )
+        
+        estimated_usage = memory_estimate["peak_memory_mb"]
+        available_memory = memory_estimate["available_memory_mb"]
+        
+        # Calculate efficiency (how close to target without exceeding)
+        efficiency = estimated_usage / available_memory
+        
+        logger.info(f"  Estimated memory: {estimated_usage:.1f} MB / {available_memory:.1f} MB available "
+                   f"({efficiency:.1%} of target)")
+        
+        if memory_estimate["has_enough_memory"]:
+            # Model fits - record as potential best
+            logger.info(colored(f"  ✓ Configuration with ratio {current_ratio:.3f} fits in memory", Colors.GREEN))
+            
+            # Check if this is more efficient than previous best
+            if best_ratio is None or efficiency > best_memory_efficiency:
+                best_ratio = current_ratio
+                best_memory_efficiency = efficiency
+                logger.info(colored(f"  → New best ratio: {best_ratio:.3f} with {efficiency:.1%} efficiency", 
+                                   Colors.BOLD + Colors.GREEN))
+            
+            # Try a larger model if we're using less than 90% of target
+            if efficiency < 0.9:
+                logger.info(f"  Model is using only {efficiency:.1%} of available memory, trying larger")
+                lower_bound = current_ratio
+                current_ratio = min(1.0, (current_ratio + upper_bound) / 2)
+            else:
+                # We found a good fit, close to the target
+                logger.info(f"  Found good fit at {efficiency:.1%} of available memory")
+                break
+        else:
+            # Model doesn't fit - adjust upper bound
+            logger.info(colored(f"  ✗ Configuration with ratio {current_ratio:.3f} exceeds available memory", 
+                              Colors.YELLOW))
+            upper_bound = current_ratio
+            current_ratio = (lower_bound + current_ratio) / 2
+    
+    # If we couldn't find a good ratio, use the lower bound with a safety margin
+    if best_ratio is None:
+        best_ratio = lower_bound * 0.9  # Add safety margin
+        logger.warning(colored(f"Could not find a good model size, using {best_ratio:.3f} with safety margin", 
+                             Colors.YELLOW))
+        return best_ratio, best_ratio, False
+    
+    # Fine-tune the hidden size and layer ratios
+    # Prefer slightly more hidden size than layers for better model quality
+    hidden_ratio = min(1.0, best_ratio * 1.1)  # 10% more hidden size
+    layers_ratio = max(0.1, best_ratio * 0.9)  # 10% fewer layers
+    
+    # Final check to make sure this is still valid
+    final_config, _ = create_scaled_config(
+        original_config,
+        hidden_ratio=hidden_ratio,
+        layers_ratio=layers_ratio
+    )
+    
+    final_estimate = improved_memory_estimation(
+        final_config, 
+        system_memory_mb,
+        target_usage_ratio
+    )
+    
+    if not final_estimate["has_enough_memory"]:
+        # Fall back to simpler approach
+        logger.warning(colored(f"Fine-tuned ratios exceed memory, using uniform ratio {best_ratio:.3f}", 
+                             Colors.YELLOW))
+        return best_ratio, best_ratio, True
+    
+    logger.info(colored(f"Final model sizing: hidden_ratio={hidden_ratio:.3f}, layers_ratio={layers_ratio:.3f}", 
+                      Colors.BOLD + Colors.GREEN))
+    logger.info(f"Estimated memory usage: {final_estimate['total_estimated_mb']:.1f} MB")
+    
+    return hidden_ratio, layers_ratio, True
+
+def staged_model_initialization(model_class, config, mesh, dtype, param_dtype=None, 
+                                batch_size=1, logger=None):
+    """
+    Initialize model in stages to reduce peak memory usage.
+    
+    Args:
+        model_class: Model class to initialize
+        config: Model configuration
+        mesh: Device mesh
+        dtype: Default dtype for model
+        param_dtype: Parameter dtype (defaults to dtype if None)
+        batch_size: Batch size for initialization
+        logger: Logger for output
+        
+    Returns:
+        Dictionary with model parameters
+    """
+    if logger is None:
+        logger = logging.getLogger("model-init")
+    
+    if param_dtype is None:
+        param_dtype = dtype
+    
+    logger.info(colored("Initializing model in stages to reduce peak memory usage", Colors.BOLD))
+    
+    # Create memory tracker
+    memory_tracker = MemoryTracker(gc_threshold_mb=500, logger=logger)
+    memory_tracker.start_tracking()
+    
+    # Keep track of all parameters
+    all_params = {}
+    
+    try:
+        # Step 1: Initialize only embedding layer
+        logger.info(colored("Stage 1/3: Initializing embeddings", Colors.BLUE))
+        embedding_config = dict(config)
+        embedding_config["num_hidden_layers"] = 0  # No layers yet
+        
+        with mesh:
+            memory_tracker.check_memory("Before embedding init", force_gc=True)
+            
+            # Initialize embedding layers only
+            temp_model = model_class(
+                config=embedding_config, 
+                mesh=mesh, 
+                dtype=dtype,
+                param_dtype=param_dtype
+            )
+            
+            # Create dummy input
+            rng = jax.random.PRNGKey(0)
+            input_ids = jnp.ones((batch_size, 16), dtype=jnp.int32)
+            
+            # Initialize embedding parameters
+            logger.info("Initializing embeddings parameters...")
+            embed_params = temp_model.init(rng, input_ids=input_ids)
+            
+            memory_tracker.check_memory("After embedding init")
+            
+            # Extract and save embedding parameters
+            embed_only_params = {}
+            for path, param in flatten_dict(embed_params).items():
+                path_str = '.'.join(str(p) for p in path)
+                if 'embed_tokens' in path_str:
+                    embed_only_params[path] = param
+            
+            # Save to combined params
+            all_params.update(embed_only_params)
+            
+            # Clear memory
+            del temp_model, embed_params, input_ids
+            memory_tracker.check_memory("After embedding cleanup", force_gc=True)
+        
+        # Step 2: Initialize transformer layers in small batches
+        logger.info(colored("Stage 2/3: Initializing transformer layers in batches", Colors.BLUE))
+        
+        # Determine how many layers to initialize at once based on model size
+        if config["hidden_size"] >= 4096:
+            layers_per_batch = 2  # Very large models
+        elif config["hidden_size"] >= 2048:
+            layers_per_batch = 4  # Large models
+        else:
+            layers_per_batch = 8  # Smaller models
+        
+        layers_per_batch = min(layers_per_batch, config["num_hidden_layers"])
+        logger.info(f"Initializing {layers_per_batch} layers at a time")
+        
+        # Process layers in batches
+        for start_layer in range(0, config["num_hidden_layers"], layers_per_batch):
+            end_layer = min(start_layer + layers_per_batch, config["num_hidden_layers"])
+            batch_size = end_layer - start_layer
+            
+            logger.info(f"Initializing layers {start_layer} to {end_layer-1} ({batch_size} layers)")
+            
+            # Create config with just these layers
+            layer_config = dict(config)
+            layer_config["num_hidden_layers"] = batch_size
+            
+            with mesh:
+                memory_tracker.check_memory(f"Before layers {start_layer}-{end_layer-1}", force_gc=True)
+                
+                # Initialize model with just these layers
+                temp_model = model_class(
+                    config=layer_config, 
+                    mesh=mesh, 
+                    dtype=dtype,
+                    param_dtype=param_dtype
+                )
+                
+                # Create dummy input
+                rng = jax.random.PRNGKey(start_layer)  # Different seed per batch
+                input_ids = jnp.ones((batch_size, 16), dtype=jnp.int32)
+                
+                # Initialize parameters
+                logger.info(f"Initializing parameters for layers {start_layer}-{end_layer-1}...")
+                batch_params = temp_model.init(rng, input_ids=input_ids)
+                
+                memory_tracker.check_memory(f"After layers {start_layer}-{end_layer-1} init")
+                
+                # Extract layer parameters and remap layer indices
+                layer_params = {}
+                for path, param in flatten_dict(batch_params).items():
+                    path_str = '.'.join(str(p) for p in path)
+                    
+                    # If this contains a layer reference, reindex to the correct position
+                    if '.h.' in path_str:
+                        # Extract layer index
+                        for i, part in enumerate(path):
+                            if part == 'h' and i+1 < len(path) and isinstance(path[i+1], int):
+                                # Remap layer index
+                                old_layer_idx = path[i+1]
+                                new_layer_idx = start_layer + old_layer_idx
+                                
+                                # Create a new path with the corrected layer index
+                                new_path = list(path)
+                                new_path[i+1] = new_layer_idx
+                                layer_params[tuple(new_path)] = param
+                                break
+                    
+                # Save layer parameters
+                all_params.update(layer_params)
+                
+                # Clear memory
+                del temp_model, batch_params, input_ids, layer_params
+                memory_tracker.check_memory(f"After layers {start_layer}-{end_layer-1} cleanup", force_gc=True)
+        
+        # Step 3: Initialize LM head
+        logger.info(colored("Stage 3/3: Initializing LM head", Colors.BLUE))
+        lm_head_config = dict(config)
+        lm_head_config["num_hidden_layers"] = 0
+        
+        with mesh:
+            memory_tracker.check_memory("Before LM head init", force_gc=True)
+            
+            # Initialize just the LM head
+            temp_model = model_class(
+                config=lm_head_config, 
+                mesh=mesh, 
+                dtype=dtype,
+                param_dtype=param_dtype
+            )
+            
+            # Create dummy input
+            rng = jax.random.PRNGKey(99)
+            input_ids = jnp.ones((batch_size, 16), dtype=jnp.int32)
+            
+            # Initialize parameters
+            logger.info("Initializing LM head parameters...")
+            lm_head_params = temp_model.init(rng, input_ids=input_ids)
+            
+            memory_tracker.check_memory("After LM head init")
+            
+            # Extract LM head parameters
+            lm_head_only_params = {}
+            for path, param in flatten_dict(lm_head_params).items():
+                path_str = '.'.join(str(p) for p in path)
+                if 'lm_head' in path_str:
+                    lm_head_only_params[path] = param
+                elif 'ln_f' in path_str:  # Final layer norm
+                    lm_head_only_params[path] = param
+                    
+            # Save LM head parameters
+            all_params.update(lm_head_only_params)
+            
+            # Clear memory
+            del temp_model, lm_head_params, input_ids, lm_head_only_params
+            memory_tracker.check_memory("After LM head cleanup", force_gc=True)
+        
+        # Unflatten the combined parameters
+        logger.info("Combining all parameters...")
+        combined_params = unflatten_dict(all_params)
+        
+        # Final garbage collection
+        del all_params
+        memory_tracker.check_memory("After parameter combination", force_gc=True)
+        
+        # Stop memory tracking
+        memory_stats = memory_tracker.stop_tracking()
+        logger.info(colored(f"Peak memory during staged initialization: {memory_tracker.peak_memory:.1f} MB", 
+                           Colors.GREEN))
+        
+        return combined_params
+        
+    except Exception as e:
+        logger.error(colored(f"Error during staged initialization: {e}", Colors.RED))
+        memory_tracker.stop_tracking()
+        # Print traceback
+        logger.error(traceback.format_exc())
+        raise
 
 def main():
     """Main function for adaptive model verification."""
