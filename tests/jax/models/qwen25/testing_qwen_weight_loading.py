@@ -31,6 +31,11 @@ python testing_qwen_weight_loading.py --weights_dir /root/wrkdir/tt-xla/tests/ja
 direct with forward
 python testing_qwen_weight_loading.py --weights_dir /root/wrkdir/tt-xla/tests/jax/models/qwen25/qwen25-weights --method direct --test_forward --memory_efficient
 
+New parameter structure verification:
+python testing_qwen_weight_loading.py --weights_dir /root/wrkdir/tt-xla/tests/jax/models/qwen25/qwen25-weights --method param_verify
+
+Using new conversion method:
+python testing_qwen_weight_loading.py --weights_dir /root/wrkdir/tt-xla/tests/jax/models/qwen25/qwen25-weights --method direct --test_forward --use_new_conversion --memory_efficient
 
 The script will output detailed diagnostics about the weight loading process.
 """
@@ -391,7 +396,23 @@ def test_forward_pass(model, config: Qwen25Config, tokenizer=None) -> bool:
                     format_found = True
                     break
                 else:
-                    missing_patterns['/'.join(param_path for param_path in param_set if '/'.join(param_path) not in missing_params)] = missing_params
+                    # Fix: use safe_path_join to handle different parameter path types
+                    format_pattern = ""
+                    try:
+                        # Get a key pattern from parameters that exist (aren't missing)
+                        existing_params = [param_path for param_path in param_set if safe_path_join(param_path) not in missing_params]
+                        if existing_params:
+                            format_pattern = safe_path_join(existing_params[0])
+                        else:
+                            # If none exist, just use the first one
+                            format_pattern = safe_path_join(param_set[0]) if param_set else "unknown"
+                        
+                        missing_patterns[format_pattern] = missing_params
+                    except Exception as e:
+                        logger.error(f"Error processing parameter paths: {e}")
+                        debug_param_path_types(param_set)  # Debug the structure
+                        # Use a fallback approach
+                        missing_patterns[f"format-{len(missing_patterns)}"] = missing_params
             
             if not format_found:
                 logger.error(f"Missing essential parameters for all supported formats")
@@ -1573,6 +1594,489 @@ def fix_missing_parameters(params, model_class, config):
         # Return original params if fixing failed
         return params
 
+def safe_path_join(path_component):
+    """
+    Safely join path components regardless of type.
+    
+    Args:
+        path_component: Path component to convert to string
+        
+    Returns:
+        Path component as a string
+    """
+    if isinstance(path_component, (list, tuple)):
+        return '/'.join(str(p) for p in path_component)
+    return str(path_component)
+
+def debug_param_path_types(param_set):
+    """
+    Debug parameter path types by examining their structure.
+    
+    Args:
+        param_set: Parameter set to debug
+        
+    Returns:
+        None
+    """
+    logger.info(f"Parameter set type: {type(param_set)}")
+    
+    if isinstance(param_set, (list, tuple, set)):
+        logger.info(f"Parameter set contents: {param_set}")
+        for i, item in enumerate(param_set):
+            logger.info(f"  Item {i} type: {type(item)}, value: {item}")
+            
+            if isinstance(item, (list, tuple)):
+                logger.info(f"    Nested item contents: {item}")
+                for j, subitem in enumerate(item):
+                    logger.info(f"      Subitem {j} type: {type(subitem)}, value: {subitem}")
+    
+    # If it's a dict or similar
+    elif hasattr(param_set, 'items'):
+        logger.info(f"Dict-like object with keys: {list(param_set.keys())}")
+
+def analyze_dict_structure(d, name="dict", level=0):
+    """
+    Analyze dictionary structure recursively to identify issues.
+    
+    Args:
+        d: Dictionary to analyze
+        name: Name of the dictionary
+        level: Current recursion level
+        
+    Returns:
+        None
+    """
+    indent = "  " * level
+    logger.info(f"{indent}{name} ({type(d)}):")
+    
+    if isinstance(d, dict) or isinstance(d, FrozenDict):
+        for k, v in d.items():
+            if isinstance(v, dict) or isinstance(v, FrozenDict):
+                analyze_dict_structure(v, f"[{k}]", level+1)
+            else:
+                shape_info = getattr(v, 'shape', None)
+                type_info = type(v)
+                logger.info(f"{indent}  [{k}]: {type_info} (shape: {shape_info})")
+
+def convert_params_to_jax_structure(weights_dict):
+    """
+    Convert loaded weights to the exact structure expected by JAX models.
+    This completely rebuilds the parameter structure to match expectations.
+    
+    Args:
+        weights_dict: Dictionary of weights loaded from safetensors
+        
+    Returns:
+        Dictionary with restructured weights matching Flax model structure
+    """
+    logger.info("Converting parameters to exact JAX structure...")
+    
+    # Create the high-level structure first
+    jax_params = {
+        "params": {
+            "model": {
+                "embed_tokens": {},
+                "layers": {}  # Will contain norm and layers_X subdicts
+            },
+            "lm_head": {}
+        }
+    }
+    
+    # Extract configuration parameters from weights to determine model structure
+    config = {}
+    if "model.embed_tokens.weight" in weights_dict:
+        vocab_size = weights_dict["model.embed_tokens.weight"].shape[0]
+        hidden_size = weights_dict["model.embed_tokens.weight"].shape[1]
+        config["vocab_size"] = vocab_size
+        config["hidden_size"] = hidden_size
+    
+    # Count number of layers based on pattern matching
+    layer_count = 0
+    for key in weights_dict:
+        if "model.layers." in key:
+            layer_num = int(key.split("model.layers.")[1].split(".")[0])
+            layer_count = max(layer_count, layer_num + 1)
+    
+    logger.info(f"Detected model structure: vocab_size={config.get('vocab_size', 'unknown')}, "
+                f"hidden_size={config.get('hidden_size', 'unknown')}, layers={layer_count}")
+    
+    # Map all parameters with explicit handling for each type
+    for key, value in weights_dict.items():
+        # Handle embeddings
+        if key == "model.embed_tokens.weight":
+            jax_params["params"]["model"]["embed_tokens"]["embedding"] = value
+        
+        # Handle final layer norm - CRITICAL FIX
+        elif key == "model.norm.weight":
+            # Ensure 'norm' exists under 'layers'
+            if "norm" not in jax_params["params"]["model"]["layers"]:
+                jax_params["params"]["model"]["layers"]["norm"] = {}
+            jax_params["params"]["model"]["layers"]["norm"]["scale"] = value
+        
+        # Handle language model head
+        elif key == "lm_head.weight":
+            jax_params["params"]["lm_head"]["kernel"] = value.T  # Transpose for Flax
+        
+        # Handle per-layer parameters
+        elif "model.layers." in key:
+            # Extract layer index and parameter type
+            parts = key.split(".")
+            if len(parts) < 4:
+                continue
+                
+            layer_idx = int(parts[2])
+            layer_key = f"layers_{layer_idx}"
+            
+            # Ensure layer exists
+            if layer_key not in jax_params["params"]["model"]["layers"]:
+                jax_params["params"]["model"]["layers"][layer_key] = {}
+            
+            # Handle attention parameters
+            if "self_attn" in key:
+                if "attention" not in jax_params["params"]["model"]["layers"][layer_key]:
+                    jax_params["params"]["model"]["layers"][layer_key]["attention"] = {}
+                
+                # Handle attention projections
+                for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+                    if f"self_attn.{proj}.weight" in key:
+                        if proj not in jax_params["params"]["model"]["layers"][layer_key]["attention"]:
+                            jax_params["params"]["model"]["layers"][layer_key]["attention"][proj] = {}
+                        jax_params["params"]["model"]["layers"][layer_key]["attention"][proj]["kernel"] = value.T
+                    elif f"self_attn.{proj}.bias" in key:
+                        if proj not in jax_params["params"]["model"]["layers"][layer_key]["attention"]:
+                            jax_params["params"]["model"]["layers"][layer_key]["attention"][proj] = {}
+                        jax_params["params"]["model"]["layers"][layer_key]["attention"][proj]["bias"] = value
+            
+            # Handle MLP parameters
+            elif "mlp" in key:
+                if "mlp" not in jax_params["params"]["model"]["layers"][layer_key]:
+                    jax_params["params"]["model"]["layers"][layer_key]["mlp"] = {}
+                
+                # Handle MLP projections
+                for proj in ["gate_proj", "up_proj", "down_proj"]:
+                    if f"mlp.{proj}.weight" in key:
+                        if proj not in jax_params["params"]["model"]["layers"][layer_key]["mlp"]:
+                            jax_params["params"]["model"]["layers"][layer_key]["mlp"][proj] = {}
+                        jax_params["params"]["model"]["layers"][layer_key]["mlp"][proj]["kernel"] = value.T
+                    elif f"mlp.{proj}.bias" in key:
+                        if proj not in jax_params["params"]["model"]["layers"][layer_key]["mlp"]:
+                            jax_params["params"]["model"]["layers"][layer_key]["mlp"][proj] = {}
+                        jax_params["params"]["model"]["layers"][layer_key]["mlp"][proj]["bias"] = value
+            
+            # Handle layer norms
+            elif "input_layernorm.weight" in key:
+                if "input_layernorm" not in jax_params["params"]["model"]["layers"][layer_key]:
+                    jax_params["params"]["model"]["layers"][layer_key]["input_layernorm"] = {}
+                jax_params["params"]["model"]["layers"][layer_key]["input_layernorm"]["scale"] = value
+                
+            elif "post_attention_layernorm.weight" in key:
+                if "post_attention_layernorm" not in jax_params["params"]["model"]["layers"][layer_key]:
+                    jax_params["params"]["model"]["layers"][layer_key]["post_attention_layernorm"] = {}
+                jax_params["params"]["model"]["layers"][layer_key]["post_attention_layernorm"]["scale"] = value
+    
+    # Validate expected structure after conversion
+    if "embedding" not in jax_params["params"]["model"]["embed_tokens"]:
+        logger.warning("❌ Embedding parameter missing in converted structure!")
+    
+    if "kernel" not in jax_params["params"]["lm_head"]:
+        logger.warning("❌ LM head parameter missing in converted structure!")
+    
+    if "norm" not in jax_params["params"]["model"]["layers"]["norm"]:
+        logger.warning("❌ Final norm parameter missing in converted structure!")
+    
+    # Important: ensure the params dict is properly frozen
+    logger.info("Freezing parameter structure...")
+    return freeze(jax_params)
+
+def verify_parameter_structure(params):
+    """
+    Verify parameter structure matches JAX expectations.
+    
+    Args:
+        params: Parameter dictionary to verify
+        
+    Returns:
+        Boolean indicating whether the structure is valid
+    """
+    # Define expected parameter paths
+    critical_params = [
+        ("params", "model", "embed_tokens", "embedding"),
+        ("params", "model", "layers", "norm", "scale"),  # Final layer norm
+        ("params", "lm_head", "kernel")
+    ]
+    
+    # Check if params is properly frozen
+    if not isinstance(params, FrozenDict):
+        logger.warning("Parameters are not properly frozen as FrozenDict")
+        params = freeze(params)
+    
+    # Flatten the parameter dict
+    flat_params = flatten_dict(params)
+    
+    # Check for critical parameters
+    missing = []
+    for path in critical_params:
+        if path not in flat_params:
+            missing.append(path)
+            # Try to find similar paths for debugging
+            similar = [k for k in flat_params.keys() if len(set(path) & set(k)) > 0]
+            logger.error(f"Missing critical parameter: {'/'.join(path)}")
+            logger.error(f"Similar parameters found: {similar[:5]}")
+    
+    if missing:
+        logger.error(f"Critical parameters missing: {missing}")
+        return False
+    
+    # Check some layer parameters are present (at least layer 0)
+    has_layer_0 = False
+    for k in flat_params.keys():
+        if len(k) >= 4 and k[0] == 'params' and k[1] == 'model' and k[2] == 'layers' and k[3] == 'layers_0':
+            has_layer_0 = True
+            break
+    
+    if not has_layer_0:
+        logger.error("Missing layer 0 parameters in structure")
+        return False
+    
+    logger.info("✅ Parameter structure verification passed")
+    return True
+
+def validate_final_norm_parameter(params):
+    """
+    Validate the final norm parameter specifically.
+    
+    Args:
+        params: Parameter dictionary to verify
+        
+    Returns:
+        Boolean indicating whether the final norm parameter is valid
+    """
+    # Check if the parameter exists at the expected path
+    try:
+        # Try different possible paths
+        if "params" in params and "model" in params["params"]:
+            model_params = params["params"]["model"]
+            
+            # Check the corrected path
+            if "layers" in model_params and "norm" in model_params["layers"]:
+                norm_param = model_params["layers"]["norm"]
+                if "scale" in norm_param:
+                    logger.info(f"✅ Final norm parameter found at correct path with shape: {norm_param['scale'].shape}")
+                    return True
+            
+            # Check the original incorrect path
+            if "norm" in model_params:
+                norm_param = model_params["norm"]
+                if "scale" in norm_param:
+                    logger.warning("⚠️ Final norm parameter found at INCORRECT path")
+                    # Suggest fix
+                    logger.info("Suggested fix: Move from params/model/norm/scale to params/model/layers/norm/scale")
+                    return False
+            
+            logger.error("❌ Final norm parameter not found in any expected location")
+            
+            # Try to find any norm-related parameters
+            flat_params = flatten_dict(params)
+            norm_related = [k for k in flat_params.keys() if "norm" in str(k)]
+            logger.info(f"Norm-related parameters found: {norm_related}")
+            
+            return False
+        
+    except Exception as e:
+        logger.error(f"Error validating final norm parameter: {e}")
+        return False
+
+def initialize_and_load_model(config, weights, memory_efficient=True):
+    """
+    Initialize model and load weights with proper structure.
+    
+    Args:
+        config: Model configuration
+        weights: Model weights
+        memory_efficient: Whether to use memory-efficient loading
+        
+    Returns:
+        Initialized model with weights loaded
+    """
+    # Create model with _do_init=True to get proper initialization
+    logger.info("Creating model with proper initialization...")
+    model = FlaxQwen25ForCausalLM(config, _do_init=True)
+    
+    # Get the exact reference structure
+    reference_params = model.params
+    
+    # Now convert our weights to the exact same structure
+    logger.info("Converting weights to exact JAX structure...")
+    if memory_efficient:
+        # Process weights incrementally
+        jax_params = convert_params_to_jax_structure(weights)
+    else:
+        # Convert all at once
+        jax_params = convert_params_to_jax_structure(weights)
+    
+    # Verify the structure is correct
+    logger.info("Verifying parameter structure...")
+    if not verify_parameter_structure(jax_params):
+        logger.warning("Parameter structure verification failed - attempting to continue")
+    
+    # Replace the model's parameters
+    logger.info("Setting model parameters...")
+    model.params = jax_params
+    
+    return model
+
+def convert_params_to_jax_structure_efficient(weights_dict):
+    """
+    Convert parameters with memory efficiency.
+    
+    Args:
+        weights_dict: Dictionary of weights loaded from safetensors
+        
+    Returns:
+        Dictionary with restructured weights matching Flax model structure
+    """
+    logger.info("Converting parameters to JAX structure with memory efficiency...")
+    
+    # Import garbage collection to manage memory
+    import gc
+    
+    # Start with an empty structure but with all required keys
+    jax_params = {
+        "params": {
+            "model": {
+                "embed_tokens": {},
+                "layers": {
+                    # Ensure this exists from the start
+                    "norm": {}
+                }
+            },
+            "lm_head": {}
+        }
+    }
+    
+    # Process parameters incrementally grouped by components
+    # Start with embedding
+    if "model.embed_tokens.weight" in weights_dict:
+        jax_params["params"]["model"]["embed_tokens"]["embedding"] = weights_dict["model.embed_tokens.weight"]
+        gc.collect()
+    
+    # Final norm - CRITICAL FIX
+    if "model.norm.weight" in weights_dict:
+        jax_params["params"]["model"]["layers"]["norm"]["scale"] = weights_dict["model.norm.weight"]
+        gc.collect()
+    
+    # LM head 
+    if "lm_head.weight" in weights_dict:
+        jax_params["params"]["lm_head"]["kernel"] = weights_dict["lm_head.weight"].T
+        gc.collect()
+    
+    # Count number of layers based on pattern matching
+    layer_count = 0
+    for key in weights_dict:
+        if "model.layers." in key:
+            layer_num = int(key.split("model.layers.")[1].split(".")[0])
+            layer_count = max(layer_count, layer_num + 1)
+    
+    # Process layers one at a time to save memory
+    for layer_idx in range(layer_count):
+        layer_key = f"layers_{layer_idx}"
+        
+        # Initialize layer structure
+        if layer_key not in jax_params["params"]["model"]["layers"]:
+            jax_params["params"]["model"]["layers"][layer_key] = {
+                "attention": {},
+                "mlp": {},
+                "input_layernorm": {},
+                "post_attention_layernorm": {}
+            }
+        
+        # Process attention parameters
+        for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+            weight_key = f"model.layers.{layer_idx}.self_attn.{proj}.weight"
+            bias_key = f"model.layers.{layer_idx}.self_attn.{proj}.bias"
+            
+            if weight_key in weights_dict:
+                if proj not in jax_params["params"]["model"]["layers"][layer_key]["attention"]:
+                    jax_params["params"]["model"]["layers"][layer_key]["attention"][proj] = {}
+                jax_params["params"]["model"]["layers"][layer_key]["attention"][proj]["kernel"] = weights_dict[weight_key].T
+            
+            if bias_key in weights_dict:
+                if proj not in jax_params["params"]["model"]["layers"][layer_key]["attention"]:
+                    jax_params["params"]["model"]["layers"][layer_key]["attention"][proj] = {}
+                jax_params["params"]["model"]["layers"][layer_key]["attention"][proj]["bias"] = weights_dict[bias_key]
+            
+            # Free memory after processing each projection
+            gc.collect()
+        
+        # Process MLP parameters
+        for proj in ["gate_proj", "up_proj", "down_proj"]:
+            weight_key = f"model.layers.{layer_idx}.mlp.{proj}.weight"
+            bias_key = f"model.layers.{layer_idx}.mlp.{proj}.bias"
+            
+            if weight_key in weights_dict:
+                if proj not in jax_params["params"]["model"]["layers"][layer_key]["mlp"]:
+                    jax_params["params"]["model"]["layers"][layer_key]["mlp"][proj] = {}
+                jax_params["params"]["model"]["layers"][layer_key]["mlp"][proj]["kernel"] = weights_dict[weight_key].T
+            
+            if bias_key in weights_dict:
+                if proj not in jax_params["params"]["model"]["layers"][layer_key]["mlp"]:
+                    jax_params["params"]["model"]["layers"][layer_key]["mlp"][proj] = {}
+                jax_params["params"]["model"]["layers"][layer_key]["mlp"][proj]["bias"] = weights_dict[bias_key]
+            
+            # Free memory after processing each projection
+            gc.collect()
+        
+        # Process layer norms
+        input_norm_key = f"model.layers.{layer_idx}.input_layernorm.weight"
+        if input_norm_key in weights_dict:
+            jax_params["params"]["model"]["layers"][layer_key]["input_layernorm"]["scale"] = weights_dict[input_norm_key]
+        
+        post_norm_key = f"model.layers.{layer_idx}.post_attention_layernorm.weight"
+        if post_norm_key in weights_dict:
+            jax_params["params"]["model"]["layers"][layer_key]["post_attention_layernorm"]["scale"] = weights_dict[post_norm_key]
+        
+        # Free memory after processing this layer
+        gc.collect()
+    
+    # Verify expected structure after conversion
+    if "embedding" not in jax_params["params"]["model"]["embed_tokens"]:
+        logger.warning("❌ Embedding parameter missing in converted structure!")
+    
+    if "kernel" not in jax_params["params"]["lm_head"]:
+        logger.warning("❌ LM head parameter missing in converted structure!")
+    
+    if "scale" not in jax_params["params"]["model"]["layers"]["norm"]:
+        logger.warning("❌ Final norm parameter missing in converted structure!")
+    
+    # Important: ensure the params dict is properly frozen
+    logger.info("Freezing parameter structure...")
+    return freeze(jax_params)
+
+def match_parameter_format(src_params, ref_params):
+    """
+    Match parameter format exactly based on reference.
+    
+    Args:
+        src_params: Source parameters to reformat
+        ref_params: Reference parameters with the desired format
+        
+    Returns:
+        Reformatted parameters
+    """
+    # Recursively match structure
+    result = {}
+    
+    # Handle nested dictionaries
+    for key, value in ref_params.items():
+        if key in src_params:
+            if isinstance(value, dict) and isinstance(src_params[key], dict):
+                result[key] = match_parameter_format(src_params[key], value)
+            else:
+                # Copy the parameter but ensure it has right type/format
+                result[key] = jnp.array(src_params[key], dtype=value.dtype)
+    
+    return result
+
 def main():
     """Main entry point for testing Qwen 2.5 weight loading."""
     parser = argparse.ArgumentParser(description="Test Qwen 2.5 weight loading")
@@ -1586,8 +2090,8 @@ def main():
         "--method",
         type=str,
         default="direct",
-        choices=["direct", "index", "model", "all", "diagnose", "check_structure"],
-        help="Weight loading method to test, or 'diagnose'/'check_structure' for diagnostics",
+        choices=["direct", "index", "model", "all", "diagnose", "check_structure", "param_verify"],
+        help="Weight loading method to test, or diagnostic modes",
     )
     parser.add_argument(
         "--test_forward",
@@ -1622,6 +2126,16 @@ def main():
         action="store_true",
         help="Attempt to automatically fix parameter structure issues",
     )
+    parser.add_argument(
+        "--param_structure_check",
+        action="store_true",
+        help="Perform detailed parameter structure check",
+    )
+    parser.add_argument(
+        "--use_new_conversion",
+        action="store_true",
+        help="Use the new parameter conversion method",
+    )
     args = parser.parse_args()
 
     # Import necessary modules for memory management
@@ -1654,6 +2168,62 @@ def main():
         logger.info("=== Checking expected model parameter structure ===")
         print_model_expected_structure(config)
         return
+    
+    # Special parameter verification mode
+    if args.method == "param_verify":
+        logger.info("=== Running parameter structure verification ===")
+        
+        # Create a minimal model to get expected structure
+        logger.info("Creating minimal model for reference structure...")
+        ref_model = FlaxQwen25ForCausalLM(config, _do_init=True)
+        
+        # Analyze reference structure
+        logger.info("Analyzing reference parameter structure...")
+        analyze_dict_structure(ref_model.params, "reference_params")
+        
+        # Load weights
+        logger.info("Loading weights for verification...")
+        weights = test_direct_safetensors(args.weights_dir, config, dtype)
+        
+        if weights is not None:
+            # Convert using new method
+            logger.info("Converting weights using new parameter conversion...")
+            if args.memory_efficient:
+                converted_params = convert_params_to_jax_structure_efficient(weights)
+            else:
+                converted_params = convert_params_to_jax_structure(weights)
+            
+            # Clear original weights to free memory
+            del weights
+            gc.collect()
+            
+            # Verify structure
+            logger.info("Verifying converted parameter structure...")
+            verify_parameter_structure(converted_params)
+            
+            # Check final norm specifically
+            logger.info("Validating final layer norm parameter...")
+            validate_final_norm_parameter(converted_params)
+            
+            # Try with a real model
+            logger.info("Testing parameter compatibility with model...")
+            try:
+                test_model = FlaxQwen25ForCausalLM(config, _do_init=False)
+                test_model.params = converted_params
+                logger.info("✅ Successfully set parameters on model")
+                
+                # Cleanup
+                del test_model
+                del converted_params
+                gc.collect()
+                jax.clear_caches()
+                
+            except Exception as e:
+                logger.error(f"❌ Failed to set parameters on model: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        return
 
     # Special diagnostic mode
     if args.method == "diagnose":
@@ -1677,7 +2247,17 @@ def main():
             # Try out our conversion without expensive validation
             try:
                 logger.info("Testing parameter structure conversion...")
-                fixed_params = fix_params_structure(weights)
+                
+                # Use new conversion method if requested
+                if args.use_new_conversion:
+                    logger.info("Using new parameter conversion method...")
+                    if args.memory_efficient:
+                        fixed_params = convert_params_to_jax_structure_efficient(weights)
+                    else:
+                        fixed_params = convert_params_to_jax_structure(weights)
+                else:
+                    # Use original fix_params_structure function
+                    fixed_params = fix_params_structure(weights)
                 
                 # Clear original weights to free memory
                 del weights
@@ -1685,9 +2265,9 @@ def main():
                 
                 # Do a simple check for expected keys
                 flat_params = flatten_dict(fixed_params)
-                has_embedding = any('embed_tokens' in '/'.join(k) for k in flat_params.keys())
-                has_layer_0 = any('layers_0' in '/'.join(k) for k in flat_params.keys())
-                has_lm_head = any('lm_head' in '/'.join(k) for k in flat_params.keys())
+                has_embedding = any('embed_tokens' in '/'.join(str(k)) for k in flat_params.keys())
+                has_layer_0 = any('layers_0' in '/'.join(str(k)) for k in flat_params.keys())
+                has_lm_head = any('lm_head' in '/'.join(str(k)) for k in flat_params.keys())
                 
                 # Check for final norm specifically
                 has_final_norm = ('params', 'model', 'layers', 'norm', 'scale') in flat_params
@@ -1698,7 +2278,7 @@ def main():
                     # Sample some parameters for inspection
                     sample_keys = []
                     for k in flat_params.keys():
-                        key_str = '/'.join(k)
+                        key_str = '/'.join(str(x) for x in k)
                         if 'layers_0' in key_str or 'embed_tokens' in key_str or 'lm_head' in key_str or 'norm' in key_str:
                             sample_keys.append(k)
                         if len(sample_keys) >= 10:
@@ -1706,7 +2286,7 @@ def main():
                             
                     logger.info("Sample parameter paths:")
                     for k in sample_keys:
-                        logger.info(f"  {'/'.join(k)}: {flat_params[k].shape}")
+                        logger.info(f"  {'/'.join(str(x) for x in k)}: {flat_params[k].shape}")
                 else:
                     logger.error("❌ Basic structure validation failed!")
                     logger.info("Missing critical components in structure:")
@@ -1715,12 +2295,30 @@ def main():
                     logger.info(f"  LM head present: {has_lm_head}")
                     logger.info(f"  Final norm present: {has_final_norm}")
                 
+                # Try loading into an uninitialized model
+                try:
+                    logger.info("Testing parameter compatibility with model...")
+                    test_model = FlaxQwen25ForCausalLM(config, _do_init=False)
+                    test_model.params = fixed_params
+                    logger.info("✅ Successfully set parameters on model")
+                    
+                    # Clear model to free memory
+                    del test_model
+                    gc.collect()
+                    jax.clear_caches()
+                except Exception as e:
+                    logger.error(f"❌ Failed to set parameters on model: {e}")
+                    import traceback
+                    traceback.print_exc()
+                
                 # Clear structures to free memory
                 del flat_params
                 del fixed_params
                 gc.collect()
             except Exception as e:
                 logger.error(f"Error during structure conversion: {e}")
+                import traceback
+                traceback.print_exc()
         
         logger.info("Diagnostic mode completed.")
         return
@@ -1746,6 +2344,12 @@ def main():
             
             logger.info(f"Loading model directly using load_model_and_weights...")
             model = load_model_and_weights(args.weights_dir, dtype=dtype)
+            
+            # Perform parameter structure check if requested
+            if args.param_structure_check and model is not None:
+                logger.info("Analyzing loaded model parameter structure...")
+                analyze_dict_structure(model.params, "alt_loaded_params")
+                validate_final_norm_parameter(model.params)
             
             if model is not None and args.test_forward:
                 logger.info("Testing forward pass with alternatively loaded weights...")
@@ -1777,9 +2381,14 @@ def main():
                 # Handle possible memory constraints
                 if args.memory_efficient:
                     logger.info("Using memory-efficient parameter conversion...")
-                    # Process params incrementally to avoid holding two full copies
-                    import gc
-                    fixed_params = fix_params_structure(params)
+                    
+                    # Use new conversion method if requested
+                    if args.use_new_conversion:
+                        logger.info("Using new parameter conversion method...")
+                        fixed_params = convert_params_to_jax_structure_efficient(params)
+                    else:
+                        # Process params incrementally to avoid holding two full copies
+                        fixed_params = fix_params_structure(params)
                     
                     # Apply auto fix if requested
                     if args.auto_fix:
@@ -1802,12 +2411,24 @@ def main():
                 else:
                     # Standard conversion
                     logger.info("Converting parameters to model format...")
-                    fixed_params = fix_params_structure(params)
+                    
+                    # Use new conversion method if requested
+                    if args.use_new_conversion:
+                        logger.info("Using new parameter conversion method...")
+                        fixed_params = convert_params_to_jax_structure(params)
+                    else:
+                        fixed_params = fix_params_structure(params)
                     
                     # Apply auto fix if requested
                     if args.auto_fix:
                         logger.info("Applying automatic parameter structure fixes...")
                         fixed_params = fix_missing_parameters(fixed_params, FlaxQwen25ForCausalLM, config)
+                    
+                    # Verify parameter structure if requested
+                    if args.param_structure_check:
+                        logger.info("Verifying parameter structure...")
+                        verify_parameter_structure(fixed_params)
+                        validate_final_norm_parameter(fixed_params)
                     
                     model.params = fixed_params
                     
