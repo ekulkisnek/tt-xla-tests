@@ -719,9 +719,14 @@ def test_forward_pass(model, config: Qwen25Config, tokenizer=None, minimal_test=
             # Use different methods depending on whether we're using external params
             if use_external_params and external_params is not None:
                 logger.info("Using external parameters with model.apply()...")
+                # Check if there's an extra 'params' level in the parameters
+                if 'params' in external_params and isinstance(external_params['params'], dict):
+                    logger.info("Removing extra 'params' nesting level from parameters")
+                    external_params = external_params['params']
                 # Disable JIT for CPU to reduce memory spikes
                 with jax.disable_jit():
-                    outputs = model.apply(external_params, input_ids, method=model.__call__)
+                    # Direct call to model.__call__ instead of using model.apply
+                    outputs = model(input_ids, params=external_params)
             else:
                 # Standard approach with model(inputs)
                 logger.info("Using model's internal parameters...")
@@ -3857,11 +3862,18 @@ def main():
                     # Run forward pass with our loaded params
                     logger.info("Running forward pass with model...")
                     try:
-                        # Use module.apply to call with our custom params
+                        # Check for double-nested parameters
+                        if "params" in params and isinstance(params["params"], dict):
+                            logger.info("Found double-nested parameters, unwrapping outer layer")
+                            params_to_use = params["params"]
+                        else:
+                            params_to_use = params
+                            
+                        # Use direct model call with params
                         with jax.disable_jit():
-                            outputs = model.module.apply(
-                                {"params": params},
+                            outputs = model(
                                 input_ids,
+                                params=params_to_use,
                                 deterministic=True,
                                 return_dict=True
                             )
@@ -4158,8 +4170,16 @@ def main():
                     
                     # Run forward pass with external parameters
                     logger.info("Testing forward pass with direct loaded weights (external params)...")
-                    test_forward_pass(model, config, tokenizer, minimal_test=args.memory_efficient, 
-                                     use_external_params=True, external_params={"params": params})
+                    
+                    # Check if params already has a 'params' key to avoid double nesting
+                    if isinstance(params, dict) and 'params' in params:
+                        logger.info("Parameters already have 'params' key, using as is")
+                        test_forward_pass(model, config, tokenizer, minimal_test=args.memory_efficient, 
+                                        use_external_params=True, external_params=params)
+                    else:
+                        logger.info("Wrapping parameters with 'params' key")
+                        test_forward_pass(model, config, tokenizer, minimal_test=args.memory_efficient, 
+                                        use_external_params=True, external_params={"params": params})
                     
                     # Clean up
                     del params
