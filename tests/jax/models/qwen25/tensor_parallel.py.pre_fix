@@ -708,12 +708,20 @@ class TensorParallelDense(nn.Module):
         # Log input shape and kernel shape for debugging
         log_shape_debug(f"TensorParallelDense: inputs.shape={inputs.shape}, kernel_shape={kernel_shape}")
         
-        # Create kernel parameter WITHOUT any sharding metadata
+        # Create sharding rules based on mesh
+        kernel_sharding = None
+        if self.mesh is not None:
+            kernel_in, kernel_out = self.shard_axes
+            kernel_sharding = P(kernel_in, kernel_out)
+            log_shape_debug(f"TensorParallelDense: kernel_sharding={kernel_sharding}")
+        
+        # Create kernel parameter with appropriate sharding
         kernel = self.param(
             'kernel',
             self.kernel_init,
             kernel_shape,
-            self.param_dtype
+            self.param_dtype,
+            kernel_sharding
         )
         
         # Cast kernel to compute precision
@@ -725,13 +733,16 @@ class TensorParallelDense(nn.Module):
         # Handle bias if needed
         if self.use_bias:
             bias_shape = (self.features,)
+            bias_sharding = None
+            if self.mesh is not None and self.shard_axes[1] is not None:
+                bias_sharding = P(self.shard_axes[1])
             
-            # Create bias parameter WITHOUT any sharding metadata
             bias = self.param(
                 'bias',
                 self.bias_init,
                 bias_shape,
-                self.param_dtype
+                self.param_dtype,
+                bias_sharding
             )
             bias = bias.astype(self.dtype)
             y = y + bias

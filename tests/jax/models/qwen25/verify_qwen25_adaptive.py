@@ -748,6 +748,65 @@ def improve_load_partial_qwen_weights(model_path, target_params, config, mesh, n
     
     log_info(f"Found {len(weight_files)} weight files")
     
+    # Add diagnostic function to inspect weight files
+    def inspect_weight_file(file_path, log_all=False):
+        """Print parameter names in a weight file, focusing on lm_head related parameters."""
+        try:
+            with safe_open(file_path, framework="numpy") as f:
+                weight_keys = list(f.keys())
+                
+                # Count how many keys contain certain patterns
+                patterns = {
+                    "lm_head": [],
+                    "embed_tokens": [],
+                    "norm.weight": []
+                }
+                
+                # Categorize keys by pattern
+                for key in weight_keys:
+                    for pattern in patterns:
+                        if pattern in key:
+                            patterns[pattern].append(key)
+                
+                # Log summary
+                log_info(f"Inspecting {os.path.basename(file_path)} - {len(weight_keys)} parameters:")
+                for pattern, keys in patterns.items():
+                    if keys:
+                        log_info(f"  Found {len(keys)} keys matching '{pattern}':")
+                        for key in keys:
+                            tensor = f.get_tensor(key)
+                            log_info(f"    - {key} (shape: {tensor.shape})")
+                
+                # Optionally log all keys
+                if log_all:
+                    log_info("  All keys:")
+                    for key in weight_keys:
+                        log_info(f"    - {key}")
+                        
+                return patterns
+        except Exception as e:
+            log_info(f"Error inspecting {file_path}: {e}")
+            return {}
+    
+    # Inspect all weight files to understand what's available
+    log_info(colored("Inspecting weight files for important parameters...", Colors.BOLD))
+    all_lm_head_keys = []
+    all_embed_tokens_keys = []
+    
+    for file_path in weight_files:
+        patterns = inspect_weight_file(file_path, log_all=False)
+        all_lm_head_keys.extend(patterns.get("lm_head", []))
+        all_embed_tokens_keys.extend(patterns.get("embed_tokens", []))
+    
+    # Log summary of findings
+    log_info(colored("Weight file inspection summary:", Colors.BOLD))
+    log_info(f"  Found {len(all_lm_head_keys)} lm_head related parameters:")
+    for key in all_lm_head_keys:
+        log_info(f"    - {key}")
+    log_info(f"  Found {len(all_embed_tokens_keys)} embed_tokens related parameters:")
+    for key in all_embed_tokens_keys:
+        log_info(f"    - {key}")
+    
     # Target sizes from reduced config
     target_hidden_size = config["hidden_size"]
     target_layers = config["num_hidden_layers"]
@@ -941,13 +1000,16 @@ def improve_load_partial_qwen_weights(model_path, target_params, config, mesh, n
         "model.layers.{}.mlp.up_proj.weight": ["transformer.h.{}.mlp.w2.kernel", "model.layers.{}.mlp.up_proj.kernel", "params.transformer.layers_{}.mlp.up_proj.kernel"],
         "model.layers.{}.mlp.down_proj.weight": ["transformer.h.{}.mlp.w3.kernel", "model.layers.{}.mlp.down_proj.kernel", "params.transformer.layers_{}.mlp.down_proj.kernel"],
         
-        # Layernorm mappings
+        # Layer norm mappings 
         "model.layers.{}.input_layernorm.weight": ["transformer.h.{}.ln_1.weight", "model.layers.{}.input_layernorm.weight", "params.transformer.layers_{}.input_layernorm.weight"],
         "model.layers.{}.post_attention_layernorm.weight": ["transformer.h.{}.ln_2.weight", "model.layers.{}.post_attention_layernorm.weight", "params.transformer.layers_{}.post_attention_layernorm.weight"],
-        
-        # Final layernorm and lm_head
         "model.norm.weight": ["transformer.ln_f.weight", "model.norm.weight", "params.transformer.norm.weight"],
-        "lm_head.weight": ["lm_head.weight", "model.lm_head.weight", "params.lm_head.weight"],
+        
+        # LM head mappings - Add multiple potential mappings for the lm_head
+        "lm_head.weight": ["lm_head.kernel", "lm_head.weight", "params.lm_head.kernel"],
+        # Try additional formats that might be in the weights
+        "model.lm_head.weight": ["lm_head.kernel", "lm_head.weight", "params.lm_head.kernel"],
+        "transformer.lm_head.weight": ["lm_head.kernel", "lm_head.weight", "params.lm_head.kernel"]
     }
     
     # For flattened parameter path lookup
@@ -958,6 +1020,13 @@ def improve_load_partial_qwen_weights(model_path, target_params, config, mesh, n
     loaded_weights = 0
     resized_weights = 0
     not_found_weights = 0
+    param_stats = {
+        "embed": {"found": 0, "not_found": 0},
+        "layers": {"found": 0, "not_found": 0},
+        "norm": {"found": 0, "not_found": 0},
+        "lm_head": {"found": 0, "not_found": 0},
+        "other": {"found": 0, "not_found": 0}
+    }
     
     # Load weights from each file
     for file_path in weight_files:
@@ -969,6 +1038,17 @@ def improve_load_partial_qwen_weights(model_path, target_params, config, mesh, n
             for key in weight_keys:
                 total_weights += 1
                 
+                # Determine weight category for stats
+                category = "other"
+                if "embed_tokens" in key:
+                    category = "embed"
+                elif "layers" in key:
+                    category = "layers"
+                elif "norm" in key:
+                    category = "norm"
+                elif "lm_head" in key:
+                    category = "lm_head"
+                
                 # Extract layer number for layer-specific weights
                 if ".layers." in key:
                     parts = key.split(".layers.")
@@ -979,6 +1059,7 @@ def improve_load_partial_qwen_weights(model_path, target_params, config, mesh, n
                             # Skip layers beyond our target layer count
                             if layer_num >= target_layers:
                                 log_info(f"Skipping {key} (layer {layer_num} > target {target_layers})", verbose_only=True)
+                                param_stats[category]["not_found"] += 1
                                 continue
                         except ValueError:
                             pass
@@ -1035,7 +1116,9 @@ def improve_load_partial_qwen_weights(model_path, target_params, config, mesh, n
                                                 # Update the parameter
                                                 current[part] = tensor
                                                 loaded_weights += 1
+                                                param_stats[category]["found"] += 1
                                                 log_info(f"Loaded {key} -> {target_key}", verbose_only=True)
+                                                found = True
                                                 break  # Break out of the target_template loop
                                             except Exception as e:
                                                 log_info(f"Error setting {target_key}: {e}", verbose_only=True)
@@ -1082,7 +1165,9 @@ def improve_load_partial_qwen_weights(model_path, target_params, config, mesh, n
                                             # Update the parameter
                                             current[part] = tensor
                                             loaded_weights += 1
+                                            param_stats[category]["found"] += 1
                                             log_info(f"Loaded {key} -> {target_key}", verbose_only=True)
+                                            found = True
                                             break  # Break out of the target_key loop
                                         except Exception as e:
                                             log_info(f"Error setting {target_key}: {e}", verbose_only=True)
@@ -1153,6 +1238,7 @@ def improve_load_partial_qwen_weights(model_path, target_params, config, mesh, n
                                     # Update the parameter
                                     current[part] = tensor
                                     loaded_weights += 1
+                                    param_stats[category]["found"] += 1
                                     log_info(f"Loaded {key} -> {param_key}", verbose_only=True)
                                     found = True
                                 except Exception as e:
@@ -1172,10 +1258,163 @@ def improve_load_partial_qwen_weights(model_path, target_params, config, mesh, n
     # Summary stats
     log_info(f"Weight loading summary:")
     log_info(f"  Total weights processed: {total_weights}")
-    log_info(f"  Weights loaded successfully: {loaded_weights}")
+    log_info(f"  Weights loaded successfully: {loaded_weights} ({(loaded_weights/total_weights*100):.1f}%)")
     log_info(f"  Weights that required resizing: {resized_weights}")
-    log_info(f"  Weights not found in target model: {not_found_weights}")
+    log_info(f"  Weights not found in target model: {not_found_weights} ({(not_found_weights/total_weights*100):.1f}%)")
     
+    # Detailed stats by category
+    log_info(f"Weight loading by category:")
+    for category, stats in param_stats.items():
+        total_cat = stats["found"] + stats["not_found"]
+        if total_cat > 0:
+            found_pct = stats["found"] / total_cat * 100
+            log_info(f"  {category}: {stats['found']}/{total_cat} loaded ({found_pct:.1f}%)")
+    
+    # Check if LM head is missing and initialize it from embeddings if needed
+    lm_head_found = param_stats["lm_head"]["found"] > 0
+    
+    # If LM head not found, try to initialize from embeddings
+    if not lm_head_found:
+        try:
+            flat_params = flatten_dict(new_params)
+            log_info(colored("LM head weights not found, initializing from embedding weights", Colors.YELLOW))
+            
+            # Try to find embedding weights
+            embed_weights = None
+            for path, param in flat_params.items():
+                path_str = '.'.join(str(p) for p in path)
+                if 'embed_tokens' in path_str and ('embedding' in path_str or 'weight' in path_str):
+                    embed_weights = param
+                    log_info(f"Found embedding weights at {path_str}, shape: {embed_weights.shape}")
+                    break
+            
+            if embed_weights is not None:
+                # Create lm_head with embedding weights
+                if 'lm_head' in new_params:
+                    if 'kernel' in new_params['lm_head']:
+                        log_info("Setting lm_head.kernel from embeddings")
+                        new_params['lm_head']['kernel'] = embed_weights
+                    else:
+                        log_info("Creating lm_head.kernel from embeddings")
+                        new_params['lm_head']['kernel'] = embed_weights
+                else:
+                    log_info("Creating full lm_head structure from embeddings")
+                    new_params['lm_head'] = {'kernel': embed_weights}
+                
+                log_info(colored("Successfully initialized LM head from embeddings", Colors.GREEN))
+            else:
+                log_info(colored("Could not find embedding weights to initialize LM head", Colors.RED))
+        except Exception as e:
+            log_info(f"Error while checking/fixing LM head: {e}")
+    else:
+        # LM head found but might be in a different structure than expected
+        # Check for common mapping issues and fix them
+        log_info(colored("LM head found, checking structure...", Colors.BOLD))
+        
+        # Get the lm_head weights
+        lm_head_weight = None
+        src_path = None
+        
+        try:
+            flat_params = flatten_dict(new_params)
+            
+            # Check all parameters for anything that looks like lm_head
+            for path, param in flat_params.items():
+                path_str = '.'.join(str(p) for p in path)
+                if 'lm_head' in path_str and ('weight' in path_str or 'kernel' in path_str):
+                    lm_head_weight = param
+                    src_path = path_str
+                    log_info(f"Found lm_head weights at {path_str}, shape: {param.shape}")
+                    break
+            
+            if lm_head_weight is not None:
+                # Ensure it's in the correct structure expected by TensorParallelQwen2ForCausalLM
+                # The expected path is ['params', 'lm_head', 'kernel'] or directly ['lm_head', 'kernel']
+                if 'params' in new_params and 'lm_head' not in new_params['params']:
+                    log_info("Adding lm_head to params collection")
+                    new_params['params']['lm_head'] = {'kernel': lm_head_weight}
+                elif 'lm_head' not in new_params:
+                    log_info("Adding lm_head to top-level params")
+                    new_params['lm_head'] = {'kernel': lm_head_weight}
+                elif 'kernel' not in new_params['lm_head']:
+                    log_info("Adding kernel to lm_head")
+                    new_params['lm_head']['kernel'] = lm_head_weight
+                
+                # Alternate fix: ensure params.params.lm_head.kernel exists (sometimes needed for flax)
+                if 'params' in new_params and 'params' not in new_params['params']:
+                    new_params['params']['params'] = {}
+                
+                if 'params' in new_params and 'params' in new_params['params'] and 'lm_head' not in new_params['params']['params']:
+                    log_info("Adding lm_head to params.params collection")
+                    new_params['params']['params']['lm_head'] = {'kernel': lm_head_weight}
+                
+                log_info(colored("Successfully restructured LM head", Colors.GREEN))
+            else:
+                log_info(colored("Could not find LM head weights despite loading success", Colors.RED))
+        except Exception as e:
+            log_info(f"Error fixing lm_head structure: {e}")
+    
+    # Add a direct fix for the most common problem pattern
+    try:
+        # Ensure the lm_head is in the correct location expected by the model
+        if 'params' in new_params:
+            if 'lm_head' in new_params and 'kernel' in new_params['lm_head']:
+                log_info("Copying lm_head from top level to params collection")
+                if 'lm_head' not in new_params['params']:
+                    new_params['params']['lm_head'] = {}
+                new_params['params']['lm_head']['kernel'] = new_params['lm_head']['kernel']
+            
+            # Additionally check the structure
+            flat_params = flatten_dict(new_params)
+            for path, param in flat_params.items():
+                if 'lm_head' in str(path) and 'kernel' in str(path):
+                    log_info(f"Verified lm_head.kernel exists at: {'.'.join(str(p) for p in path)}")
+    except Exception as e:
+        log_info(f"Error during direct parameter structure fix: {e}")
+
+    # Check if embeddings are missing but lm_head is available
+    embed_found = param_stats["embed"]["found"] > 0
+    if not embed_found and lm_head_found:
+        try:
+            flat_params = flatten_dict(new_params)
+            log_info(colored("Embeddings not found, initializing from lm_head weights", Colors.YELLOW))
+            
+            # Find lm_head weights
+            lm_head_weight = None
+            for path, param in flat_params.items():
+                path_str = '.'.join(str(p) for p in path)
+                if 'lm_head' in path_str and ('weight' in path_str or 'kernel' in path_str):
+                    lm_head_weight = param
+                    log_info(f"Found lm_head weights at {path_str}, shape: {lm_head_weight.shape}")
+                    break
+            
+            if lm_head_weight is not None:
+                # Create embeddings from lm_head weights
+                if 'transformer' in new_params:
+                    if 'embed_tokens' not in new_params['transformer']:
+                        log_info("Creating transformer.embed_tokens from lm_head")
+                        new_params['transformer']['embed_tokens'] = {'embedding': lm_head_weight}
+                    else:
+                        if 'embedding' not in new_params['transformer']['embed_tokens']:
+                            log_info("Creating transformer.embed_tokens.embedding from lm_head")
+                            new_params['transformer']['embed_tokens']['embedding'] = lm_head_weight
+                
+                # Also try params.transformer path
+                if 'params' in new_params and 'transformer' in new_params['params']:
+                    if 'embed_tokens' not in new_params['params']['transformer']:
+                        log_info("Creating params.transformer.embed_tokens from lm_head")
+                        new_params['params']['transformer']['embed_tokens'] = {'embedding': lm_head_weight}
+                    else:
+                        if 'embedding' not in new_params['params']['transformer']['embed_tokens']:
+                            log_info("Creating params.transformer.embed_tokens.embedding from lm_head")
+                            new_params['params']['transformer']['embed_tokens']['embedding'] = lm_head_weight
+                
+                log_info(colored("Successfully initialized embeddings from lm_head", Colors.GREEN))
+            else:
+                log_info(colored("Could not find lm_head weights to initialize embeddings", Colors.RED))
+        except Exception as e:
+            log_info(f"Error while initializing embeddings from lm_head: {e}")
+
     # Apply our parameter mapping fix
     try:
         from tensor_parallel import map_parameter_paths
@@ -1190,6 +1429,113 @@ def improve_load_partial_qwen_weights(model_path, target_params, config, mesh, n
         new_params = fix_parameter_structure(new_params)
     except Exception as e:
         log_info(f"Error applying parameter fixes: {e}")
+    
+    # Final verification of parameter structure
+    def verify_param_structure(params, config):
+        """Verify that parameter structure has all required components."""
+        flat_params = flatten_dict(params)
+        
+        # Essential component paths that must exist
+        essential_components = {
+            "lm_head": False,
+            "embed_tokens": False,
+            "ln_f": False,  # Final layer norm
+        }
+        
+        # Key parameter paths that should exist
+        expected_paths = [
+            "lm_head.kernel",
+            "params.lm_head.kernel",
+            "params.params.lm_head.kernel"
+        ]
+        found_expected_paths = {path: False for path in expected_paths}
+        
+        # Component-specific checks
+        lm_head_shape = None
+        embed_shape = None
+        
+        # Check for essential components
+        for path, param in flat_params.items():
+            path_str = '.'.join(str(p) for p in path)
+            
+            # Check for lm_head in various possible locations
+            if "lm_head" in path_str and "kernel" in path_str:
+                essential_components["lm_head"] = True
+                lm_head_shape = param.shape
+                
+                # Check specific paths
+                for expected_path in expected_paths:
+                    if expected_path in path_str:
+                        found_expected_paths[expected_path] = True
+                
+            if "embed_tokens" in path_str and ("embedding" in path_str or "weight" in path_str):
+                essential_components["embed_tokens"] = True
+                embed_shape = param.shape
+                
+            if ("ln_f" in path_str or "norm" in path_str) and "weight" in path_str:
+                essential_components["ln_f"] = True
+        
+        # Check if all essential components exist
+        all_components_found = all(essential_components.values())
+        
+        # Make sure dimensions match between lm_head and embeddings
+        shape_match = True
+        if lm_head_shape is not None and embed_shape is not None:
+            # Check if shapes are compatible (allowing for transposition)
+            if sorted(lm_head_shape) != sorted(embed_shape):
+                log_info(colored(f"Warning: LM head shape {lm_head_shape} doesn't match embedding shape {embed_shape}", Colors.YELLOW))
+                shape_match = False
+        
+        # Check existence of transformer layers up to num_hidden_layers
+        layers_found = 0
+        num_layers = config["num_hidden_layers"]
+        for i in range(num_layers):
+            layer_found = False
+            for path_str in [p for p, _ in flat_params.items()]:
+                path_str = '.'.join(str(p) for p in path_str)
+                # Check for layer-specific patterns
+                if f"h.{i}." in path_str or f"layers_{i}" in path_str or f"layers.{i}" in path_str:
+                    layer_found = True
+                    break
+            
+            if layer_found:
+                layers_found += 1
+        
+        # Report findings
+        log_info(colored("Parameter Structure Verification:", Colors.BOLD))
+        for component, found in essential_components.items():
+            status = colored("✓ Found", Colors.GREEN) if found else colored("✗ Missing", Colors.RED)
+            log_info(f"  {component}: {status}")
+        
+        # Report on expected paths
+        log_info(colored("Expected Parameter Paths:", Colors.BOLD))
+        for path, found in found_expected_paths.items():
+            status = colored("✓ Found", Colors.GREEN) if found else colored("✗ Missing", Colors.YELLOW)
+            log_info(f"  {path}: {status}")
+        
+        log_info(f"  Transformer layers: {layers_found}/{num_layers} found")
+        if layers_found < num_layers:
+            log_info(colored(f"  Warning: Only {layers_found} of {num_layers} required layers were found", Colors.YELLOW))
+        
+        # Overall result - we consider it valid if lm_head exists in any location and the shapes are compatible
+        if essential_components["lm_head"] and shape_match:
+            log_info(colored("✓ LM head validation successful", Colors.GREEN + Colors.BOLD))
+            
+            # Show full validation result
+            if all_components_found and layers_found == num_layers:
+                log_info(colored("✓ Complete parameter structure validation successful", Colors.GREEN + Colors.BOLD))
+                return True
+            else:
+                log_info(colored("⚠ Partial parameter structure validation - model may work with limitations", Colors.YELLOW + Colors.BOLD))
+                return True
+        else:
+            log_info(colored("✗ Parameter structure validation failed - model will not work", Colors.RED + Colors.BOLD))
+            return False
+    
+    # Perform structure verification
+    structure_valid = verify_param_structure(new_params, config)
+    if not structure_valid:
+        log_info(colored("Warning: Parameter structure has issues that may affect model operation", Colors.YELLOW))
     
     return new_params
 
@@ -1592,9 +1938,56 @@ def verify_adaptive_model(
             # Run inference
             logger.info("Running forward pass...")
             inference_start = time.time()
-            outputs = model.apply(params, input_ids=input_ids)
-            forward_time = time.time() - inference_start
-            logger.info(colored(f"✅ Forward pass completed in {forward_time:.2f} seconds", Colors.GREEN))
+            
+            # Fix parameter structure - extract inner params if needed
+            apply_params = params
+            if "params" in params and isinstance(params["params"], dict):
+                # Check for double nesting issue
+                if "params" in params["params"]:
+                    logger.info(colored("Detected double-nested params structure, using params['params']", Colors.YELLOW))
+                    apply_params = params["params"]
+            
+            # Try to run the forward pass with the corrected params
+            try:
+                outputs = model.apply(apply_params, input_ids=input_ids)
+                forward_time = time.time() - inference_start
+                logger.info(colored(f"✅ Forward pass completed in {forward_time:.2f} seconds", Colors.GREEN))
+            except Exception as e:
+                # If that failed, try with just the inner params
+                if "params" in params:
+                    logger.info(colored("First attempt failed, trying with inner params structure", Colors.YELLOW))
+                    try:
+                        outputs = model.apply({"params": params["params"]}, input_ids=input_ids)
+                        forward_time = time.time() - inference_start
+                        logger.info(colored(f"✅ Forward pass completed in {forward_time:.2f} seconds", Colors.GREEN))
+                    except Exception as e2:
+                        # If even that failed, try with the right set of keys
+                        logger.info(colored("Second attempt failed, trying with adjusted structure", Colors.YELLOW))
+                        try:
+                            # This is the most stripped-down structure
+                            stripped_params = {"params": {}}
+                            
+                            # Get the lm_head kernel - this is critical
+                            if "lm_head" in params:
+                                stripped_params["params"]["lm_head"] = params["lm_head"]
+                            elif "params" in params and "lm_head" in params["params"]:
+                                stripped_params["params"]["lm_head"] = params["params"]["lm_head"]
+                            
+                            # Get transformer if available
+                            if "transformer" in params:
+                                stripped_params["params"]["transformer"] = params["transformer"]
+                            elif "params" in params and "transformer" in params["params"]:
+                                stripped_params["params"]["transformer"] = params["params"]["transformer"]
+                            
+                            outputs = model.apply(stripped_params, input_ids=input_ids)
+                            forward_time = time.time() - inference_start
+                            logger.info(colored(f"✅ Forward pass completed with stripped params in {forward_time:.2f} seconds", Colors.GREEN))
+                        except Exception as e3:
+                            # Re-raise the original error
+                            raise e
+                else:
+                    # If no inner params, re-raise the exception
+                    raise e
         
         # Log metrics after forward pass
         log_system_metrics("After forward pass") if verbose else None
