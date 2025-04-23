@@ -9,7 +9,7 @@ source venv/bin/activate
 Weights can be found in
 qwen25-weights/
 
-Memory-optimized version that implements streaming parameter loading.
+Memory-optimized version that implements streaming parameter loading.  
 """
 
 import os
