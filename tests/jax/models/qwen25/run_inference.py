@@ -11,6 +11,7 @@ import argparse
 import re
 import gc
 import json
+import datetime
 from typing import Dict, List, Optional, Tuple, Union
 
 import jax
@@ -215,9 +216,48 @@ def merge_param_dicts(base_dict, new_dict):
             base_dict[key] = value
     return base_dict
 
-def print_stream(text):
-    """Print text with streaming effect."""
+def log_output_text(prompt, response, output_file=None):
+    """
+    Log the prompt and generated text to a file.
+    
+    Args:
+        prompt: The input prompt
+        response: The generated response
+        output_file: Path to output file, if None a timestamped file will be created
+    
+    Returns:
+        Path to the output file
+    """
+    if output_file is None:
+        # Create output directory if it doesn't exist
+        output_dir = os.path.join(os.getcwd(), "outputs")
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Create timestamped filename
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = os.path.join(output_dir, f"qwen25_output_{timestamp}.txt")
+    
+    with open(output_file, "w") as f:
+        f.write(f"Prompt: {prompt}\n\n")
+        f.write(f"Generated Response:\n{response}\n")
+        
+    logger.info(f"Output saved to: {output_file}")
+    return output_file
+
+def print_stream(text, output_file=None):
+    """
+    Print text with streaming effect and optionally append to a file.
+    
+    Args:
+        text: Text to print and log
+        output_file: Optional file path to append streaming output
+    """
     print(text, end="", flush=True)
+    
+    # If output file is provided, append the streamed text
+    if output_file:
+        with open(output_file, "a") as f:
+            f.write(text)
 
 def parse_args():
     """Parse command line arguments."""
@@ -302,6 +342,19 @@ def parse_args():
         "--profile",
         action="store_true",
         help="Enable detailed memory profiling"
+    )
+    
+    parser.add_argument(
+        "--output_file",
+        type=str,
+        default=None,
+        help="Save generated text to this file (if not specified, a timestamped file will be created)"
+    )
+    
+    parser.add_argument(
+        "--no_save",
+        action="store_true",
+        help="Don't save generated text to a file"
     )
     
     return parser.parse_args()
@@ -524,7 +577,33 @@ def main():
         # Run inference with streaming
         generation_start_time = time.time()
         try:
-            stream_handler = None if args.no_stream else print_stream
+            # Set up output file for streaming if requested
+            streaming_output_file = None
+            if not args.no_save:
+                # Create output directory if it doesn't exist
+                output_dir = os.path.join(os.getcwd(), "outputs")
+                os.makedirs(output_dir, exist_ok=True)
+                
+                # Create timestamped filename if not provided
+                if args.output_file is None:
+                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    streaming_output_file = os.path.join(output_dir, f"qwen25_output_{timestamp}.txt")
+                else:
+                    streaming_output_file = args.output_file
+                
+                # Write the prompt to the output file
+                with open(streaming_output_file, "w") as f:
+                    f.write(f"Prompt: {args.prompt}\n\n")
+                    f.write("Generated Response:\n")
+                
+                logger.info(f"Streaming output to: {streaming_output_file}")
+            
+            # Configure stream handler with output file
+            if args.no_stream:
+                stream_handler = None
+            else:
+                # Create a partial function with the output file
+                stream_handler = lambda text: print_stream(text, streaming_output_file)
             
             # Profile memory if requested
             if args.profile:
@@ -550,6 +629,11 @@ def main():
             # Print the full response if streaming was disabled
             if args.no_stream:
                 print(full_response)
+                
+                # Save the full response if not already streaming to file
+                if not args.no_save and streaming_output_file:
+                    with open(streaming_output_file, "a") as f:
+                        f.write(full_response)
                 
             # Log memory after generation
             end_mem = log_memory_usage("after generation")
@@ -593,6 +677,12 @@ def main():
             logger.info(f"Generation time: {generation_time:.2f}s")
         
         print("\n\nGeneration completed!")
+            
+        # Save generated text to file if requested
+        if not args.no_save:
+            # Skip explicit logging since we already handled streaming to file
+            if streaming_output_file:
+                logger.info(f"Complete response saved to: {streaming_output_file}")
             
     except Exception as e:
         logger.error(f"Error: {e}")
