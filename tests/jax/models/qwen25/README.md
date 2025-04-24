@@ -1,89 +1,117 @@
-# Qwen25 JAX Model with Tensor Parallelism
+# Tensor-Parallel Qwen2.5-7B JAX Implementation
 
-This directory contains a JAX implementation of the Qwen25 model with tensor parallelism support, enabling efficient inference on multi-GPU/TPU systems.
+A JAX implementation of Qwen2.5-7B with tensor parallelism support for multi-device inference.
 
-## Features
+## Overview
 
-- JAX-based implementation for XLA compilation
-- Tensor parallelism support for multi-device inference
-- Memory-efficient attention mechanism
-- Streaming text generation
-- Support for standard sampling techniques (temperature, top-k, top-p)
+This implementation provides a memory-efficient, tensor-parallelized version of the Qwen2.5-7B model running in JAX. It supports various mesh shapes for tensor parallelism and is designed to run efficiently on multiple devices.
 
-## Getting Started
+Key features:
+- Tensor parallelism (not data parallelism)
+- Memory-efficient parameter loading
+- Support for various mesh shapes (1x8, 2x4, etc.)
+- JAX JIT compilation for fast inference
+- Incremental decoding with KV-cache
 
-### Prerequisites
+## Model Architecture
 
-- JAX and Flax
-- Transformers library (for tokenizer)
-- Safetensors (for loading model weights)
+The Qwen2.5-7B model is a decoder-only transformer with the following components:
 
-### Installation
+- **Token Embeddings**: Maps input token IDs to dense vectors
+- **Transformer Layers** (28 layers):
+  - **Self-Attention**: Multi-head attention with rotary position embeddings
+  - **Feed-Forward Network**: SwiGLU activation with gate and up/down projections
+- **Layer Normalization**: Applied before attention and FFN
+- **Language Modeling Head**: Maps hidden states to vocabulary logits
 
-Make sure you have the required dependencies:
+### Tensor Parallelism Implementation
 
-```bash
-pip install jax jaxlib flax transformers safetensors
-```
+The model uses tensor parallelism to shard computation across multiple devices:
 
-For GPU support, install the appropriate JAX version:
+1. **Attention Computation**:
+   - Query, Key, Value projections are sharded across the "model" dimension
+   - Each device processes a subset of attention heads
+   - Output projection is sharded in the opposite direction
 
-```bash
-pip install --upgrade "jax[cuda]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-```
+2. **Feed-Forward Network**:
+   - Gate and Up projections are sharded across the "model" dimension
+   - Down projection is sharded in the opposite direction
 
-### Downloading Qwen25 Model Weights
-
-The Qwen25 weights are already available locally at `qwen25-weights` directory.
-
-If you need to download fresh weights:
-
-```bash
-git lfs install
-git clone https://huggingface.co/Qwen/Qwen2.5-7B
-```
+3. **Language Modeling Head**:
+   - Sharded across the "model" dimension to distribute the large vocabulary matrix
 
 ## Usage
 
-### Running Inference
+### Requirements
 
-There are two ways to run inference with the Qwen25 model:
+- JAX >= 0.4.10
+- Flax >= 0.7.2
+- safetensors
+- transformers
 
-#### 1. Memory-Efficient Inference
+### Running the Model
 
-This script focuses on memory optimization and runs a simple forward pass with the model:
-
-```bash
-# Basic usage - run the memory-efficient version
-python run_memory_efficient.py --weights_dir qwen25-weights --dtype bfloat16
-
-# With additional options
-python run_memory_efficient.py --weights_dir qwen25-weights --dtype bfloat16 --generate --profile
-```
-
-#### 2. Text Generation
-
-For interactive text generation with custom prompts:
+Basic usage:
 
 ```bash
-# Generate text from a prompt
-python run_inference.py --model_path qwen25-weights \
-    --prompt "Write a short story about a robot learning to paint:" \
-    --max_tokens 200
-
-# With custom generation parameters
-python run_inference.py --model_path qwen25-weights \
-    --prompt "Explain how quantum computing works:" \
-    --max_tokens 300 \
-    --temperature 0.8 \
-    --top_p 0.92 \
-    --top_k 40 \
-    --dtype bfloat16
+python qwen25_tp.py --model_path /path/to/qwen25-weights --prompt "Your prompt here" --mesh_shape 1,8
 ```
 
-### Advanced Options
+Options:
+- `--model_path`: Path to the Qwen2.5-7B model weights (safetensors format with config.json)
+- `--prompt`: Text prompt for generation
+- `--max_tokens`: Maximum number of tokens to generate (default: 100)
+- `--temperature`: Sampling temperature (default: 0.7)
+- `--top_k`: Top-k sampling parameter (default: 50)
+- `--top_p`: Nucleus sampling threshold (default: 0.9)
+- `--mesh_shape`: Device mesh shape for tensor parallelism (default: "1,8")
+- `--dtype`: Data type for parameters (default: "bfloat16")
+- `--simulate_tp`: Simulate tensor parallelism on a single device
 
-- `--dtype`: Choose between float32, float16, or bfloat16 (default is bfloat16)
-- `--mesh_shape`: Configure device mesh for tensor parallelism (e.g., '1,8')
-- `--debug`: Enable detailed debug logging
-- `--no_stream`: Disable streaming output during generation
+### Supported Mesh Shapes
+
+The implementation supports various mesh shapes for tensor parallelism:
+- `1,8`: 1 data-parallel shard, 8 model-parallel shards
+- `2,4`: 2 data-parallel shards, 4 model-parallel shards
+- `1,32`: 1 data-parallel shard, 32 model-parallel shards
+- `8,4`: 8 data-parallel shards, 4 model-parallel shards
+
+## Memory Efficiency
+
+The implementation includes several optimizations for memory efficiency:
+1. **Streaming Parameter Loading**: Processes one safetensors file at a time
+2. **Garbage Collection**: Actively frees memory during parameter loading
+3. **KV-Cache Management**: Efficient handling of cached key-value states
+4. **JAX JIT Compilation**: Optimizes computation through XLA
+
+## Single-Device Usage
+
+For systems with limited hardware, you can:
+1. Use `--simulate_tp` to simulate tensor parallelism on a single device
+2. The model automatically adjusts the mesh shape based on available devices
+
+## Implementation Details
+
+### Key Components
+
+- `TensorParallelDense`: Dense layer with tensor parallelism support
+- `QwenAttention`: Multi-head attention with tensor parallelism
+- `QwenMLP`: Feed-forward network with tensor parallelism
+- `Qwen25ForCausalLM`: Top-level model class
+
+### Parameter Loading
+
+The model loads parameters in a memory-efficient manner by:
+1. Processing one safetensors file at a time
+2. Converting parameters to JAX arrays with the correct dtype
+3. Transposing weight matrices as needed
+4. Merging parameters into the parameter dictionary
+5. Garbage collecting after processing each file
+
+## License
+
+This implementation follows the license of the original Qwen2.5 model.
+
+## Citation
+
+If you use this implementation in your work, please cite both this repository and the original Qwen2.5 model.
