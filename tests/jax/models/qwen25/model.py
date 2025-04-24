@@ -378,6 +378,63 @@ def validate_qwen_configuration(config):
         
     return normalized_config
 
+def compute_cos_sin_cache(
+    position_ids: jnp.ndarray,
+    head_dim: int,
+    rope_theta: float = 10000.0,
+    max_seq_len: int = 4096,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Compute cos and sin cache for rotary position embeddings.
+    
+    Args:
+        position_ids: Position ids with shape [batch_size, seq_len]
+        head_dim: Hidden dimension of each attention head
+        rope_theta: Base value for rotary embeddings (default: 10000.0)
+        max_seq_len: Maximum expected sequence length (for optimization)
+        
+    Returns:
+        Tuple of (cos, sin) with shapes [batch_size, seq_len, head_dim]
+    """
+    # Log input values for debugging
+    logger.debug(f"compute_cos_sin_cache: position_ids shape={position_ids.shape}, head_dim={head_dim}")
+    
+    if len(position_ids.shape) != 2:
+        logger.warning(f"Expected position_ids to have shape [batch_size, seq_len], got {position_ids.shape}")
+    
+    batch_size, seq_len = position_ids.shape
+    
+    # We need to create a position embedding dimension of the form:
+    # [1, seq_len, head_dim//2]
+    # and then use broadcasting to align with the query/key tensors
+    
+    # Create the dimension factors for the rotation
+    dim = head_dim // 2
+    inv_freq = 1.0 / (rope_theta ** (jnp.arange(0, dim, dtype=jnp.float32) / dim))
+    
+    # Create the position embedding dimension
+    # We ravel position_ids to ensure proper shape for outer product
+    position_ids_flat = position_ids.reshape(-1)
+    
+    # Compute the outer product of positions and frequencies
+    # This creates the position embedding
+    freqs = jnp.outer(position_ids_flat, inv_freq)
+    
+    # Convert to complex numbers in polar form: cos + i*sin
+    # We create the rotational basis via complex exponential
+    emb = jnp.exp(1j * freqs)
+    
+    # Extract real and imaginary parts (cos and sin)
+    cos = jnp.real(emb)
+    sin = jnp.imag(emb)
+    
+    # Reshape to match expected output dimensions [batch_size, seq_len, head_dim//2]
+    cos = cos.reshape(batch_size, seq_len, dim)
+    sin = sin.reshape(batch_size, seq_len, dim)
+    
+    logger.debug(f"compute_cos_sin_cache: Generated cos with shape={cos.shape}, sin with shape={sin.shape}")
+    
+    return cos, sin
+
 # Rotation helpers for applying rotary position embeddings
 @error_handler
 def apply_rotary_emb(
@@ -403,21 +460,60 @@ def apply_rotary_emb(
     log_tensor_shape(cos, "apply_rotary_emb input cos")
     log_tensor_shape(sin, "apply_rotary_emb input sin")
     
+    # Handle potential sequence length mismatch between query_states and position embeddings
+    query_seq_len = query_states.shape[1]
+    cos_seq_len = cos.shape[1] if len(cos.shape) >= 2 else cos.shape[0]
+    
+    if query_seq_len != cos_seq_len:
+        logger.warning(f"Sequence length mismatch: query_seq_len={query_seq_len}, cos_seq_len={cos_seq_len}")
+        # If cos/sin are shorter than query, we need to extend them
+        # This typically happens during generation when we add one token at a time
+        if cos_seq_len < query_seq_len and len(cos.shape) >= 2:
+            # For generation, we're typically adding just one token, so the position
+            # embedding should be the last position in the sequence
+            if query_seq_len - cos_seq_len == 1:
+                # Get the last position embedding and extend
+                if len(cos.shape) == 2:  # [seq_len, dim]
+                    new_pos = cos_seq_len
+                    new_cos = jnp.expand_dims(cos[cos_seq_len-1], axis=0)
+                    new_sin = jnp.expand_dims(sin[cos_seq_len-1], axis=0)
+                    cos = jnp.concatenate([cos, new_cos], axis=0)
+                    sin = jnp.concatenate([sin, new_sin], axis=0)
+                elif len(cos.shape) == 3:  # [batch, seq_len, dim]
+                    new_pos = cos_seq_len
+                    new_cos = jnp.expand_dims(cos[:, cos_seq_len-1], axis=1)
+                    new_sin = jnp.expand_dims(sin[:, cos_seq_len-1], axis=1)
+                    cos = jnp.concatenate([cos, new_cos], axis=1)
+                    sin = jnp.concatenate([sin, new_sin], axis=1)
+            else:
+                # For larger differences, we may need to recompute the position embeddings
+                # or truncate the query - this shouldn't typically happen with proper position tracking
+                logger.error(f"Large sequence length difference: query={query_seq_len}, cos={cos_seq_len}")
+                # Truncate query to match position embeddings as a fallback
+                query_states = query_states[:, :cos_seq_len]
+                query_seq_len = cos_seq_len
+        
+        # If cos/sin are longer than query, we can just use the first query_seq_len elements
+        elif cos_seq_len > query_seq_len and len(cos.shape) >= 2:
+            if len(cos.shape) == 2:  # [seq_len, dim]
+                cos = cos[:query_seq_len]
+                sin = sin[:query_seq_len]
+            elif len(cos.shape) == 3:  # [batch, seq_len, dim]
+                cos = cos[:, :query_seq_len]
+                sin = sin[:, :query_seq_len]
+    
     # Get appropriate dimensions
     q_dim = query_states.shape[-1] // 2
     k_dim = key_states.shape[-1] // 2
     
-    # Split into real and imaginary parts
+    # Split query into real and imaginary parts for complex multiplication
     query_states_r = query_states.reshape(*query_states.shape[:-1], -1, 2)
     query_real, query_imag = query_states_r[..., 0], query_states_r[..., 1]
     
-    # Calculate the actual dimension for the reshape
+    # Get the actual dimension for the reshape
     dim_half = query_real.shape[-1]
     
-    # Make sure the cos/sin are properly shaped for the operation
-    # The key issue: We need to ensure cos/sin have correct size before reshaping
-    # instead of hardcoding the dimensions
-    cos_seq_len = cos.shape[0]
+    # Make sure cos/sin feature dimensions match
     cos_feature_dim = cos.shape[-1] if len(cos.shape) > 1 else dim_half
     
     # If cos/sin last dimension != dim_half, we need to slice it
@@ -427,89 +523,70 @@ def apply_rotary_emb(
         sin = sin[..., :dim_half]
         cos_feature_dim = dim_half
     
-    # Now reshape using the actual dimensions, preserving the original shape structure
-    # Instead of hardcoding the shape, we'll adapt to the input shape
-    if len(cos.shape) == 2:
-        # If cos shape is (seq_len, dim)
+    # Reshape cos/sin for broadcasting - adapt to the input shape
+    if len(cos.shape) == 2:  # [seq_len, dim]
+        # Need to add batch and head dimensions for broadcasting
+        cos_seq_len = cos.shape[0]
         cos_for_q = cos.reshape(1, cos_seq_len, 1, cos_feature_dim)
         sin_for_q = sin.reshape(1, cos_seq_len, 1, cos_feature_dim)
-    elif len(cos.shape) == 3:
-        # If cos shape is (batch, seq_len, dim) or similar
-        # Preserve the first dimension, adjust the remaining ones
+    elif len(cos.shape) == 3:  # [batch, seq_len, dim]
+        # Need to add head dimension for broadcasting
         cos_for_q = cos.reshape(cos.shape[0], cos.shape[1], 1, cos.shape[2])
         sin_for_q = sin.reshape(sin.shape[0], sin.shape[1], 1, sin.shape[2])
     else:
-        # For other shapes, log the shape and attempt a reasonable reshape
+        # For other shapes, attempt a flexible reshape
         logger.warning(f"Unusual cos shape: {cos.shape}, attempting flexible reshape")
-        # Just add a dimension for head at position -2
+        # Add a dimension for head if needed
         shape_list = list(cos.shape)
         shape_list.insert(len(shape_list)-1, 1)
         cos_for_q = cos.reshape(shape_list)
         sin_for_q = sin.reshape(shape_list)
     
-    # Log shapes for debugging
+    # Ensure broadcasting compatibility by checking shapes
     logger.debug(f"query_real shape={query_real.shape}, cos_for_q shape={cos_for_q.shape}")
     
-    # Apply rotation to query
+    # Apply rotation to query (complex multiplication)
     query_out_real = query_real * cos_for_q - query_imag * sin_for_q
     query_out_imag = query_real * sin_for_q + query_imag * cos_for_q
     
-    # Combine and reshape back
+    # Combine and reshape back to original query shape
     query_out = jnp.stack([query_out_real, query_out_imag], axis=-1)
     query_out = query_out.reshape(*query_states.shape)
     
-    # Similarly process key states
-    # Make sure cos/sin dimensions match key states
+    # Apply similar rotation to key states
+    key_states_r = key_states.reshape(*key_states.shape[:-1], -1, 2)
+    key_real, key_imag = key_states_r[..., 0], key_states_r[..., 1]
+    
+    # Use the same cos/sin as for query but possibly slice to match key dimension
     if cos.shape[-1] > k_dim:
-        # Slice again for key dimension if needed
-        logger.info(f"Slicing cos/sin from shape {cos.shape} to match key dimension {k_dim}")
         cos_for_key = cos[..., :k_dim]
         sin_for_key = sin[..., :k_dim]
     else:
         cos_for_key = cos
         sin_for_key = sin
     
-    # Split key into real and imaginary parts
-    key_states_r = key_states.reshape(*key_states.shape[:-1], -1, 2)
-    key_real, key_imag = key_states_r[..., 0], key_states_r[..., 1]
-    
-    # Calculate actual dimensions for key reshape
-    key_dim_half = key_real.shape[-1]
-    key_cos_feature_dim = cos_for_key.shape[-1] if len(cos_for_key.shape) > 1 else key_dim_half
-    
-    # If cos/sin last dimension != key_dim_half, we need to slice it
-    if key_cos_feature_dim > key_dim_half:
-        logger.info(f"Slicing cos/sin key feature dim from {key_cos_feature_dim} to {key_dim_half}")
-        cos_for_key = cos_for_key[..., :key_dim_half]
-        sin_for_key = sin_for_key[..., :key_dim_half]
-        key_cos_feature_dim = key_dim_half
-    
-    # Reshape cos/sin for broadcasting with key - use same approach as for query
-    if len(cos_for_key.shape) == 2:
-        # If cos shape is (seq_len, dim)
+    # Reshape cos/sin for key broadcasting
+    if len(cos_for_key.shape) == 2:  # [seq_len, dim]
         cos_for_k = cos_for_key.reshape(1, cos_for_key.shape[0], 1, cos_for_key.shape[1])
         sin_for_k = sin_for_key.reshape(1, sin_for_key.shape[0], 1, sin_for_key.shape[1])
-    elif len(cos_for_key.shape) == 3:
-        # If cos shape is (batch, seq_len, dim) or similar
+    elif len(cos_for_key.shape) == 3:  # [batch, seq_len, dim]
         cos_for_k = cos_for_key.reshape(cos_for_key.shape[0], cos_for_key.shape[1], 1, cos_for_key.shape[2])
         sin_for_k = sin_for_key.reshape(sin_for_key.shape[0], sin_for_key.shape[1], 1, sin_for_key.shape[2])
     else:
-        # For other shapes, log the shape and attempt a reasonable reshape
-        logger.warning(f"Unusual cos_for_key shape: {cos_for_key.shape}, attempting flexible reshape")
-        # Just add a dimension for head at position -2
+        # Flexible reshape for unusual shapes
         shape_list = list(cos_for_key.shape)
         shape_list.insert(len(shape_list)-1, 1)
         cos_for_k = cos_for_key.reshape(shape_list)
         sin_for_k = sin_for_key.reshape(shape_list)
     
-    # Log shapes for debugging
+    # Ensure broadcasting compatibility for key
     logger.debug(f"key_real shape={key_real.shape}, cos_for_k shape={cos_for_k.shape}")
     
-    # Apply rotation to key
+    # Apply rotation to key (complex multiplication)
     key_out_real = key_real * cos_for_k - key_imag * sin_for_k
     key_out_imag = key_real * sin_for_k + key_imag * cos_for_k
     
-    # Combine and reshape back
+    # Combine and reshape back to original key shape
     key_out = jnp.stack([key_out_real, key_out_imag], axis=-1)
     key_out = key_out.reshape(*key_states.shape)
     
@@ -574,7 +651,23 @@ def generalized_attention(
         # Pre-process the attention mask if provided
         if mask is not None:
             # Extract mask shape for dynamic slicing later
-            mask_b, mask_h, mask_q, mask_k = mask.shape
+            mask_shape = mask.shape
+            # Handle both 4D and 6D attention masks
+            if len(mask_shape) == 4:
+                mask_b, mask_h, mask_q, mask_k = mask_shape
+            elif len(mask_shape) == 6:
+                # For 6D mask [batch, 1, 1, 1, 1, seq_len]
+                # We can reshape it to [batch, 1, 1, seq_len]
+                mask_b, _, _, _, _, mask_k = mask_shape
+                mask_h, mask_q = 1, 1
+                # Reshape the mask to 4D format
+                mask = mask.reshape(mask_b, mask_h, mask_q, mask_k)
+            else:
+                logger.error(f"Unsupported mask shape: {mask_shape}")
+                # Default to some reasonable values to prevent crash
+                mask_b, mask_h, mask_q, mask_k = mask_shape[0], 1, 1, mask_shape[-1]
+                # Try to reshape to 4D as a fallback
+                mask = mask.reshape(mask_b, mask_h, mask_q, mask_k)
             
             # Check that mask is compatible with our attention shape
             if mask_h != 1 and mask_h != num_q_heads:
@@ -738,24 +831,27 @@ class QwenAttention(nn.Module):
     def __call__(
         self,
         hidden_states: jnp.ndarray,
-        cos: jnp.ndarray = None,
-        sin: jnp.ndarray = None,
         attention_mask: Optional[jnp.ndarray] = None,
         position_ids: Optional[jnp.ndarray] = None,
         past_key_value: Optional[Tuple[jnp.ndarray, jnp.ndarray]] = None,
         output_attentions: bool = False,
+        cos: jnp.ndarray = None,
+        sin: jnp.ndarray = None,
         mesh: Optional[Mesh] = None,
         **kwargs  # Handle any additional arguments
     ) -> jnp.ndarray:
         # Log input shapes for debugging
         log_tensor_shape(hidden_states, "QwenAttention input hidden_states")
-        log_tensor_shape(attention_mask, "QwenAttention input attention_mask")
-        log_tensor_shape(cos, "QwenAttention input cos")
-        log_tensor_shape(sin, "QwenAttention input sin")
+        if attention_mask is not None:
+            log_tensor_shape(attention_mask, "QwenAttention input attention_mask")
+        if position_ids is not None:
+            log_tensor_shape(position_ids, "QwenAttention input position_ids")
+        if cos is not None:
+            log_tensor_shape(cos, "QwenAttention input cos")
+        if sin is not None:
+            log_tensor_shape(sin, "QwenAttention input sin")
         
-        bsz, seqlen, _ = hidden_states.shape
-        
-        # Project to query, key, value
+        # Project hidden states into query, key, and value
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
@@ -764,23 +860,40 @@ class QwenAttention(nn.Module):
         log_tensor_shape(key_states, "QwenAttention after projection key")
         log_tensor_shape(value_states, "QwenAttention after projection value")
         
-        # Reshape and apply rope
-        query_states = query_states.reshape(bsz, seqlen, self.num_heads, self.head_dim)
-        key_states = key_states.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        value_states = value_states.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        # Reshape for multi-head attention:
+        # [batch, seq_len, hidden_size] -> [batch, seq_len, n_heads, head_dim]
+        batch_size, seq_len, _ = hidden_states.shape
+        
+        # Reshape query to [batch, seq_len, num_heads, head_dim]
+        query_states = query_states.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        # Reshape key and value to [batch, seq_len, num_kv_heads, head_dim]
+        key_states = key_states.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        value_states = value_states.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
         
         log_tensor_shape(query_states, "QwenAttention after reshape query")
         log_tensor_shape(key_states, "QwenAttention after reshape key")
         log_tensor_shape(value_states, "QwenAttention after reshape value")
         
-        # Apply rotary embeddings if sin and cos are provided
-        if cos is not None and sin is not None:
-            query_states, key_states = apply_rotary_emb(query_states, key_states, cos, sin)
-            log_tensor_shape(query_states, "QwenAttention after rotary emb query")
-            log_tensor_shape(key_states, "QwenAttention after rotary emb key")
+        # Apply rotary position embedding
+        if position_ids is not None:
+            # Generate rotary embeddings if not provided
+            if cos is None or sin is None:
+                cos, sin = compute_cos_sin_cache(
+                    position_ids,
+                    self.head_dim,
+                    self.rope_theta
+                )
+                logger.debug(f"Generating rotary embeddings with position_ids shape={position_ids.shape}")
+            
+            # Apply rotary embeddings to query and key
+            query_states, key_states = apply_rotary_emb(
+                query_states, key_states, cos, sin
+            )
         
-        # Transpose for attention computation
-        # [batch, seq, heads, dim] -> [batch, heads, seq, dim]
+        log_tensor_shape(query_states, "QwenAttention after rotary emb query")
+        log_tensor_shape(key_states, "QwenAttention after rotary emb key")
+        
+        # Transpose: [batch, seq_len, num_heads, head_dim] -> [batch, num_heads, seq_len, head_dim]
         query_states = jnp.transpose(query_states, (0, 2, 1, 3))
         key_states = jnp.transpose(key_states, (0, 2, 1, 3))
         value_states = jnp.transpose(value_states, (0, 2, 1, 3))
@@ -789,66 +902,53 @@ class QwenAttention(nn.Module):
         log_tensor_shape(key_states, "QwenAttention after transpose key")
         log_tensor_shape(value_states, "QwenAttention after transpose value")
         
-        # Validate attention shapes before proceeding
-        try:
-            validate_attention_shapes(
-                query_states, key_states, value_states, self.config
-            )
-        except ValueError as e:
-            logger.error(f"Attention shape validation error: {e}")
-            logger.error(f"This often indicates a mismatch in the number of attention heads or their dimensions.")
-            raise
-        
-        # Process attention mask if provided
+        # Handle attention mask - prepare it for the attention function
         attn_mask = None
         if attention_mask is not None:
-            # Make sure attention mask has the right shape for the attention function
-            # Expected shape: [batch, heads, q_length, kv_length]
+            # Process attention mask based on its shape
             if len(attention_mask.shape) == 4:
                 # Already in the right shape
                 attn_mask = attention_mask
-            elif len(attention_mask.shape) == 2:
-                # Expand from [batch, length] to [batch, 1, 1, length]
-                attn_mask = attention_mask[:, None, None, :]
-                # Convert from additive (0/1) to large negative for softmax
-                attn_mask = (1.0 - attn_mask) * jnp.finfo(self.dtype).min
+            elif len(attention_mask.shape) == 6:
+                # For 6D mask [batch, 1, 1, 1, 1, seq_len]
+                # We can reshape it to [batch, 1, 1, seq_len]
+                batch_size, _, _, _, _, seq_len = attention_mask.shape
+                attn_mask = attention_mask.reshape(batch_size, 1, 1, seq_len)
             else:
-                # Interpret mask shape
-                attn_mask = attention_mask
+                # Fallback for other shapes
+                logger.warning(f"Unsupported attention mask shape: {attention_mask.shape}. "
+                             f"Attempting to reshape to 4D.")
+                # Try to reshape to standard 4D format
+                try:
+                    attn_mask = attention_mask.reshape(batch_size, 1, 1, attention_mask.shape[-1])
+                except:
+                    logger.error(f"Could not reshape attention mask with shape {attention_mask.shape}. "
+                                f"Proceeding without attention mask.")
+                    attn_mask = None
             
-            log_tensor_shape(attn_mask, "QwenAttention processed mask")
+            if attn_mask is not None:
+                log_tensor_shape(attn_mask, "QwenAttention processed mask")
         
         # Compute attention
         attn_output = self.attention_fn(
-            query_states,
-            key_states,
-            value_states,
+            query_states, key_states, value_states,
             mask=attn_mask,
+            precision=self.config.get("precision", None),
             mesh=mesh,
         )
         
-        log_tensor_shape(attn_output, "QwenAttention after attention computation")
+        log_tensor_shape(attn_output, "QwenAttention after attention")
         
-        # Reshape to [batch, seq, hidden_size]
+        # Transpose back to [batch, seq_len, n_heads, head_dim]
         attn_output = jnp.transpose(attn_output, (0, 2, 1, 3))
-        attn_output = attn_output.reshape(bsz, seqlen, self.hidden_size)
         
-        log_tensor_shape(attn_output, "QwenAttention after reshape attention output")
+        # Reshape back to [batch, seq_len, hidden_size]
+        attn_output = attn_output.reshape(batch_size, seq_len, self.hidden_size)
         
-        # Apply output projection
+        # Final projection
         attn_output = self.o_proj(attn_output)
         
-        log_tensor_shape(attn_output, "QwenAttention final output")
-        
-        outputs = (attn_output,)
-        
-        if output_attentions:
-            # We don't store attention weights in the current implementation
-            # Just return a dummy tensor
-            attention_weights = jnp.zeros((bsz, self.num_heads, seqlen, seqlen), dtype=self.dtype)
-            outputs = outputs + (attention_weights,)
-        
-        return outputs[0] if len(outputs) == 1 else outputs
+        return attn_output
 
 
 class QwenMLP(nn.Module):

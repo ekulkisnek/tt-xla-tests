@@ -15,15 +15,17 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh
+from jax.sharding import Mesh, PartitionSpec as P
 import numpy as np
+from functools import partial
 
 # Add the directory to path for local imports
 script_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, script_dir)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(script_dir))))
 
-# Import Qwen25 model and generation functions - change to use local imports
-from model import load_qwen25_model, create_qwen25_model
+# Import Qwen25 model and generation functions
+from model import create_qwen25_model
 from generate import generate_text
 
 # Import safetensors for weight loading
@@ -40,6 +42,21 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger("qwen25_inference")
+
+# Memory tracking
+try:
+    import psutil
+    def log_memory_usage(label=""):
+        """Log current memory usage with an optional label."""
+        process = psutil.Process(os.getpid())
+        memory_info = process.memory_info()
+        rss_gb = memory_info.rss / (1024 * 1024 * 1024)
+        logger.info(f"Memory usage {label}: {rss_gb:.2f} GB")
+        return rss_gb
+except ImportError:
+    def log_memory_usage(label=""):
+        logger.info("psutil not available for memory tracking")
+        return 0
 
 # Parameter name mapping helpers from run_memory_efficient.py
 def get_param_path(name):
@@ -198,73 +215,6 @@ def merge_param_dicts(base_dict, new_dict):
             base_dict[key] = value
     return base_dict
 
-def load_model_parameters(weights_dir, dtype=jnp.bfloat16):
-    """
-    Load model parameters from safetensors files in the given directory.
-    Implements the successful loading strategy from run_memory_efficient.py.
-    
-    Args:
-        weights_dir: Directory containing model weights
-        dtype: Data type for model parameters
-        
-    Returns:
-        tuple of (config, params) where config is the model configuration and
-        params is the loaded and formatted parameters
-    """
-    try:
-        # Load configuration
-        config_path = os.path.join(weights_dir, "config.json")
-        with open(config_path, 'r') as f:
-            config = json.load(f)
-        logger.info(f"Loaded configuration with {config.get('num_hidden_layers', 'unknown')} layers")
-        
-        # Enable memory optimizations
-        config["use_memory_efficient_attention"] = True
-
-        # Initialize parameters
-        params = {"params": {}}
-        
-        # Process weights by streaming parameters from each file
-        safetensors_files = sorted([f for f in os.listdir(weights_dir) if f.endswith(".safetensors")])
-        
-        if not safetensors_files:
-            raise ValueError(f"No safetensors files found in {weights_dir}")
-        
-        logger.info(f"Loading parameters from {len(safetensors_files)} files")
-        
-        # Track memory for each file
-        file_memories = []
-        
-        # Load each file and merge parameters
-        t0_total = time.time()
-        for i, filename in enumerate(safetensors_files):
-            weight_path = os.path.join(weights_dir, filename)
-            logger.info(f"Processing file {i+1}/{len(safetensors_files)}: {filename}")
-            
-            # Process one file at a time
-            t0 = time.time()
-            file_params = process_safetensors_file(weight_path, dtype=dtype)
-            
-            # Merge parameters
-            params = merge_param_dicts(params, file_params)
-            
-            # Log progress
-            file_time = time.time() - t0
-            logger.info(f"Processed {filename} in {file_time:.2f} seconds")
-            
-            # Force garbage collection
-            del file_params
-            gc.collect()
-        
-        total_load_time = time.time() - t0_total
-        logger.info(f"Total parameter loading time: {total_load_time:.2f} seconds")
-        
-        return config, params
-    
-    except Exception as e:
-        logger.error(f"Error loading model parameters: {e}")
-        raise
-
 def print_stream(text):
     """Print text with streaming effect."""
     print(text, end="", flush=True)
@@ -342,10 +292,22 @@ def parse_args():
         help="Disable streaming output"
     )
     
+    parser.add_argument(
+        "--shard",
+        action="store_true",
+        help="Enable parameter sharding across devices"
+    )
+    
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable detailed memory profiling"
+    )
+    
     return parser.parse_args()
 
 def main():
-    """Run Qwen25 inference."""
+    """Run Qwen25 inference with memory optimizations."""
     # Parse command line arguments
     args = parse_args()
     
@@ -355,8 +317,12 @@ def main():
         os.environ["QWEN_DEBUG"] = "1"
     
     # Print JAX devices info
+    logger.info(f"JAX version: {jax.__version__}")
     logger.info(f"JAX devices: {jax.devices()}")
     logger.info(f"Number of devices: {jax.device_count()}")
+    
+    # Track initial memory usage
+    initial_mem = log_memory_usage("initial")
     
     # Set data type
     if args.dtype == "float32":
@@ -366,71 +332,131 @@ def main():
     else:
         dtype = jnp.bfloat16
     
+    logger.info(f"Using dtype: {dtype}")
+    
     # Configure device mesh for tensor parallelism
+    devices = jax.devices()
+    mesh = None
+    
     if args.mesh_shape:
         mesh_shape = tuple(map(int, args.mesh_shape.split(",")))
     else:
-        # Use simple 1D mesh by default (all devices in a row)
-        # Ensure we're creating a mesh shape that matches our device array
+        # Use simple 1D mesh by default
         device_count = jax.device_count()
         if device_count == 1:
-            # For single device, use a simple 1D mesh
             mesh_shape = (1,)
         else:
-            # For multiple devices, create a 2D mesh
-            mesh_shape = (1, device_count)
+            mesh_shape = (1, device_count)  # (data_parallel, model_parallel)
     
     logger.info(f"Using mesh shape: {mesh_shape}")
     
-    # Load tokenizer - try to use local files from the model path first
-    try:
-        from transformers import AutoTokenizer
-        
-        # Check if tokenizer files exist in the model path
-        tokenizer_files = ["tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt"]
-        has_tokenizer_files = any(os.path.exists(os.path.join(args.model_path, f)) for f in tokenizer_files)
-        
-        if has_tokenizer_files:
-            logger.info(f"Loading tokenizer from model path: {args.model_path}")
-            tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-            logger.info("Loaded tokenizer from model path")
+    # Create device mesh for tensor parallelism if sharding is enabled
+    if args.shard and len(devices) > 1:
+        logger.info(f"Creating device mesh for tensor parallelism: {mesh_shape}")
+        if len(mesh_shape) == 1:
+            # For 1D mesh, use a single axis name
+            mesh = Mesh(np.array(devices), ("data",))
         else:
-            # Try from cache
-            try:
-                tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B", local_files_only=True)
-                logger.info("Loaded tokenizer from local cache")
-            except Exception as e:
-                logger.info(f"Error loading tokenizer locally: {e}")
-                logger.info("Downloading tokenizer from Hugging Face Hub")
-                tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B")
-    except Exception as e:
-        logger.error(f"Error loading tokenizer: {e}")
-        raise RuntimeError(f"Failed to load tokenizer: {e}")
-    
-    # Create mesh for device parallelism
-    devices = jax.devices()
-    if len(mesh_shape) == 1:
-        # For 1D mesh, use a single axis name
-        mesh = Mesh(np.array(devices), ("data",))
+            # For 2D mesh, reshape devices to match the mesh shape
+            devices_reshaped = np.array(devices).reshape(mesh_shape)
+            mesh = Mesh(devices_reshaped, ("dp", "mp"))  # data_parallel, model_parallel
     else:
-        # For 2D mesh, reshape devices to 2D and use both axis names
-        devices_reshaped = np.array(devices).reshape(mesh_shape)
-        mesh = Mesh(devices_reshaped, ("data", "model"))
+        if len(mesh_shape) == 1:
+            # For 1D mesh, use a single axis name
+            mesh = Mesh(np.array(devices), ("data",))
+        else:
+            # For 2D mesh, reshape devices to 2D and use both axis names
+            devices_reshaped = np.array(devices).reshape(mesh_shape)
+            mesh = Mesh(devices_reshaped, ("data", "model"))
     
-    # Load model and parameters
-    start_time = time.time()
     try:
-        logger.info(f"Loading Qwen25 model from {args.model_path}")
+        # Load model configuration first
+        config_path = os.path.join(args.model_path, "config.json")
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        logger.info(f"Loaded configuration with {config.get('num_hidden_layers', 'unknown')} layers")
         
-        # Use our parameter loading function that matches run_memory_efficient.py's approach
-        config, params = load_model_parameters(args.model_path, dtype=dtype)
+        # Enable memory optimizations
+        config["use_memory_efficient_attention"] = True
         
-        # Create model with the loaded configuration
-        logger.info("Creating model with loaded configuration")
+        # Create model BEFORE loading parameters
+        logger.info("Creating model structure...")
+        t0 = time.time()
         model = create_qwen25_model(config, dtype=dtype)
+        logger.info(f"Model structure created in {time.time() - t0:.2f}s")
         
-        load_time = time.time() - start_time
-        logger.info(f"Model loaded in {load_time:.2f}s")
+        # Log memory after model creation
+        model_creation_mem = log_memory_usage("after model creation")
+        
+        # Load tokenizer - try to use local files from the model path first
+        try:
+            from transformers import AutoTokenizer
+            
+            # Check if tokenizer files exist in the model path
+            tokenizer_files = ["tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt"]
+            has_tokenizer_files = any(os.path.exists(os.path.join(args.model_path, f)) for f in tokenizer_files)
+            
+            if has_tokenizer_files:
+                logger.info(f"Loading tokenizer from model path: {args.model_path}")
+                tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+                logger.info("Loaded tokenizer from model path")
+            else:
+                # Try from cache
+                try:
+                    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B", local_files_only=True)
+                    logger.info("Loaded tokenizer from local cache")
+                except Exception as e:
+                    logger.info(f"Error loading tokenizer locally: {e}")
+                    logger.info("Downloading tokenizer from Hugging Face Hub")
+                    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B")
+        except Exception as e:
+            logger.error(f"Error loading tokenizer: {e}")
+            raise RuntimeError(f"Failed to load tokenizer: {e}")
+            
+        # Tokenizer memory usage
+        tokenizer_mem = log_memory_usage("after tokenizer loading")
+            
+        # Load parameters from safetensors files
+        logger.info(f"Loading parameters from {args.model_path}...")
+        params = {"params": {}}
+        
+        # Process weights by streaming parameters from each file
+        safetensors_files = sorted([f for f in os.listdir(args.model_path) if f.endswith(".safetensors")])
+        
+        if not safetensors_files:
+            raise ValueError(f"No safetensors files found in {args.model_path}")
+        
+        # Track memory for each file
+        file_memories = []
+        
+        # Load parameters
+        t0_total = time.time()
+        for i, filename in enumerate(safetensors_files):
+            weight_path = os.path.join(args.model_path, filename)
+            logger.info(f"Processing file {i+1}/{len(safetensors_files)}: {filename}")
+            
+            # Process one file at a time
+            t0 = time.time()
+            file_params = process_safetensors_file(weight_path, dtype=dtype)
+            
+            # Merge parameters
+            params = merge_param_dicts(params, file_params)
+            
+            # Log progress and memory usage
+            file_time = time.time() - t0
+            logger.info(f"Processed {filename} in {file_time:.2f} seconds")
+            current_mem = log_memory_usage(f"after file {i+1}/{len(safetensors_files)}")
+            file_memories.append((filename, current_mem, file_time))
+            
+            # Force garbage collection
+            del file_params
+            gc.collect()
+        
+        total_load_time = time.time() - t0_total
+        logger.info(f"Total parameter loading time: {total_load_time:.2f} seconds")
+        
+        # Log memory after parameter loading
+        params_loaded_mem = log_memory_usage("after all parameters loaded")
         
         # Print model configuration
         logger.info(f"Model configuration: hidden_size={config['hidden_size']}, "
@@ -449,68 +475,132 @@ def main():
                 for layer_key in [k for k in params["params"].keys() if k.startswith("layers_")][:2]:
                     layer_keys = list(params["params"][layer_key].keys())
                     logger.debug(f"Layer {layer_key} keys: {layer_keys}")
-    except Exception as e:
-        logger.error(f"Error loading model: {e}")
-        import traceback
-        traceback.print_exc()
-        logger.error("Falling back to creating model without loading weights (for debugging)")
         
-        # Create empty configuration for debugging
-        config = {
-            "hidden_size": 3584,
-            "num_attention_heads": 28,
-            "num_hidden_layers": 28,
-            "num_key_value_heads": 4,
-            "vocab_size": 151936,
-            "use_memory_efficient_attention": True,
-        }
+        # Prepare dummy input to warm up the model
+        logger.info("Running model warm-up to compile functions...")
+        dummy_input_ids = jnp.ones((1, 16), dtype=jnp.int32)
         
-        # Create model with empty params
-        model = create_qwen25_model(config, dtype=dtype)
-        params = None
-    
-    # Print prompt
-    print(f"\nPrompt: {args.prompt}\n")
-    print("Generated Response:")
-    
-    # Run inference with streaming
-    try:
-        stream_handler = None if args.no_stream else print_stream
+        # Pre-compile the forward function
+        @partial(jax.jit, static_argnums=(2,))
+        def forward_fn(params, input_ids, return_dict=True):
+            return model.apply(
+                params,
+                input_ids=input_ids,
+                attention_mask=None,
+                position_ids=None,
+                past_key_values=None,
+                output_attentions=False,
+                output_hidden_states=False,
+                return_dict=return_dict,
+                mesh=mesh,
+            )
         
-        full_response = generate_text(
-            model=model, 
-            tokenizer=tokenizer, 
-            prompt_tokens=args.prompt,
-            params=params,
-            mesh=mesh,
-            max_decode_tokens=args.max_tokens,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            top_k=args.top_k,
-            streamer=stream_handler,
-            debug=args.debug
-        )
+        # Run a warm-up pass to compile the model
+        try:
+            logger.info("Running warm-up forward pass...")
+            t0 = time.time()
+            with jax.profiler.trace("warmup_forward_pass"):
+                _ = forward_fn(params, dummy_input_ids)
+            logger.info(f"Warm-up completed in {time.time() - t0:.2f}s")
+        except Exception as e:
+            logger.warning(f"Warm-up forward pass failed: {e}")
+            logger.warning("Continuing without warm-up...")
         
-        # Print the full response if streaming was disabled
-        if args.no_stream:
-            print(full_response)
-    except Exception as e:
-        logger.error(f"Error during generation: {e}")
-        import traceback
-        traceback.print_exc()
+        # Clear backend caches to free memory
+        jax.clear_caches()
+        gc.collect()
         
-        if params is None:
-            logger.error("Generation failed because model parameters were not loaded.")
-            logger.error("Make sure the model weights are in the correct format (safetensors).")
+        # Log memory after warm-up
+        warmup_mem = log_memory_usage("after warm-up")
+        
+        # Print prompt
+        print(f"\nPrompt: {args.prompt}\n")
+        print("Generated Response:")
+        
+        # Pre-compile generation
         if args.debug:
-            # Log additional information in debug mode
-            logger.debug(f"Model: {type(model)}")
-            logger.debug(f"Tokenizer: {type(tokenizer)}")
-            if params is not None:
+            logger.debug("Starting text generation...")
+        
+        # Run inference with streaming
+        generation_start_time = time.time()
+        try:
+            stream_handler = None if args.no_stream else print_stream
+            
+            # Profile memory if requested
+            if args.profile:
+                start_gen_mem = log_memory_usage("before generation")
+            
+            full_response = generate_text(
+                model=model, 
+                tokenizer=tokenizer, 
+                prompt_tokens=args.prompt,
+                params=params,
+                mesh=mesh,
+                max_decode_tokens=args.max_tokens,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+                streamer=stream_handler,
+                debug=args.debug
+            )
+            
+            generation_time = time.time() - generation_start_time
+            logger.info(f"Generation completed in {generation_time:.2f}s")
+            
+            # Print the full response if streaming was disabled
+            if args.no_stream:
+                print(full_response)
+                
+            # Log memory after generation
+            end_mem = log_memory_usage("after generation")
+            
+        except Exception as e:
+            logger.error(f"Error during generation: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            if args.debug:
+                # Log additional information in debug mode
+                logger.debug(f"Model: {type(model)}")
+                logger.debug(f"Tokenizer: {type(tokenizer)}")
                 param_keys = list(params.keys() if hasattr(params, 'keys') else ['<Nested Structure>'])
                 logger.debug(f"Parameters keys: {param_keys}")
+        
+        # Print memory usage summary if profiling
+        if args.profile or args.debug:
+            # Measure final memory usage if not already done
+            end_mem = log_memory_usage("after error or completion")
+            
+            logger.info("\n==== Memory Usage Summary ====")
+            logger.info(f"Initial memory usage: {initial_mem:.2f} GB")
+            logger.info(f"After model creation: {model_creation_mem:.2f} GB (+{model_creation_mem - initial_mem:.2f} GB)")
+            logger.info(f"After tokenizer loading: {tokenizer_mem:.2f} GB (+{tokenizer_mem - model_creation_mem:.2f} GB)")
+            logger.info(f"After loading parameters: {params_loaded_mem:.2f} GB (+{params_loaded_mem - tokenizer_mem:.2f} GB)")
+            logger.info(f"After warm-up: {warmup_mem:.2f} GB (+{warmup_mem - params_loaded_mem:.2f} GB)")
+            logger.info(f"After generation/error: {end_mem:.2f} GB (+{end_mem - warmup_mem:.2f} GB)")
+            logger.info(f"Total memory increase: {end_mem - initial_mem:.2f} GB")
+            
+            # Print parameter loading details
+            logger.info("\n==== Parameter Loading Details ====")
+            for i, (filename, mem, load_time) in enumerate(file_memories):
+                prev_mem = initial_mem if i == 0 else file_memories[i-1][1]
+                logger.info(f"File {i+1}: {filename} - {mem:.2f} GB (+{mem - prev_mem:.2f} GB) - {load_time:.2f}s")
+            
+            # Print model info
+            num_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
+            logger.info(f"\nModel parameters: {num_params:,}")
+            logger.info(f"Model size in memory: {params_loaded_mem:.2f} GB")
+            logger.info(f"Generation time: {generation_time:.2f}s")
+        
+        print("\n\nGeneration completed!")
+            
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
     
-    print("\n\nGeneration completed!")
+    return 0
 
 if __name__ == "__main__":
-    main() 
+    exit(main()) 

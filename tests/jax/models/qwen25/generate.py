@@ -2,6 +2,7 @@
 Text generation functionality for Qwen25 JAX model.
 """
 
+import os
 import jax
 import jax.numpy as jnp
 from typing import Dict, List, Optional, Tuple, Union, Callable, Any
@@ -10,10 +11,26 @@ import numpy as np
 import time
 from functools import partial
 import logging
+import gc
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("qwen25_generate")
+
+# Memory tracking
+try:
+    import psutil
+    def log_memory_usage(label=""):
+        """Log current memory usage with an optional label."""
+        process = psutil.Process(os.getpid())
+        memory_info = process.memory_info()
+        rss_gb = memory_info.rss / (1024 * 1024 * 1024)
+        logger.info(f"Memory usage {label}: {rss_gb:.2f} GB")
+        return rss_gb
+except ImportError:
+    def log_memory_usage(label=""):
+        logger.info("psutil not available for memory tracking")
+        return 0
 
 def sample_next_token(
     logits: jnp.ndarray, 
@@ -136,15 +153,19 @@ def generate_text(
         Complete generated text (prompt + continuation)
     """
     # Debug logging to understand parameter structure
-    logger.info("=== DEBUG: Parameter Structure ===")
-    logger.info(f"Model type: {type(model)}")
-    logger.info(f"Params type: {type(params)}")
-    if hasattr(params, "keys"):
-        logger.info(f"Params keys: {list(params.keys())}")
-    else:
-        logger.info(f"Params doesn't have keys method, type: {type(params)}")
-    logger.info(f"kwargs: {kwargs}")
-    logger.info("=== END DEBUG ===")
+    if debug:
+        logger.info("=== DEBUG: Parameter Structure ===")
+        logger.info(f"Model type: {type(model)}")
+        logger.info(f"Params type: {type(params)}")
+        if hasattr(params, "keys"):
+            logger.info(f"Params keys: {list(params.keys())}")
+        else:
+            logger.info(f"Params doesn't have keys method, type: {type(params)}")
+        logger.info(f"kwargs: {kwargs}")
+        logger.info("=== END DEBUG ===")
+    
+    # Log initial memory usage
+    generation_start_mem = log_memory_usage("start of generation") if debug else 0
     
     # Configuration settings
     generation_start_time = time.time()
@@ -162,11 +183,29 @@ def generate_text(
     else:
         input_ids = prompt_tokens
     
-    # Create attention mask
-    attention_mask = np.ones_like(input_ids)
+    # Log the shape of input_ids
+    if debug:
+        logger.info(f"Input tokens shape: {input_ids.shape}")
     
-    # Position IDs
+    # Create attention mask - use 4D format for Qwen model
+    batch_size = input_ids.shape[0]
+    seq_length = input_ids.shape[1]
+    attention_mask = np.ones((batch_size, 1, 1, seq_length), dtype=np.int32)
+    
+    # Position IDs - make sure to match the input_ids length
     position_ids = np.arange(input_ids.shape[1])[None, :]
+    
+    if debug:
+        logger.info(f"Initial shapes: input_ids={input_ids.shape}, attention_mask={attention_mask.shape}, position_ids={position_ids.shape}")
+    
+    # IMPORTANT: Ensure position_ids shape exactly matches input_ids shape
+    # This prevents shape mismatch errors in apply_rotary_emb
+    if position_ids.shape[1] != input_ids.shape[1]:
+        logger.warning(f"Position IDs shape {position_ids.shape} doesn't match input_ids shape {input_ids.shape}. Adjusting...")
+        # Create position_ids to match input_ids exactly
+        position_ids = np.arange(input_ids.shape[1], dtype=np.int32)[None, :]
+        position_ids = np.broadcast_to(position_ids, input_ids.shape)
+        logger.info(f"Adjusted position_ids shape: {position_ids.shape}")
     
     # Initialize generation state
     state = {
@@ -183,15 +222,37 @@ def generate_text(
     # Create a PRNG key for sampling
     rng_key = jax.random.PRNGKey(int(time.time() * 1000) % 2**32)
     
-    # Define a compiled forward step function
+    # Define a compiled forward step function - use a pure JAX version for better memory performance
     @partial(jax.jit, static_argnums=(4,))
-    def forward_step(ids, mask, pos_ids, past_kv, return_dict):
-        # This implementation consistently works in run_memory_efficient.py
+    def forward_step(params, ids, mask, pos_ids, return_dict):
+        """
+        Memory-optimized forward step function.
+        """
+        # Note: model.apply is the correct way to use the model
         return model.apply(
-            params,  # No additional wrapping needed
-            input_ids=ids,
+            params,  # Use params directly without further nesting
+            input_ids=ids, 
             attention_mask=mask,
             position_ids=pos_ids,
+            past_key_values=None,  # Handle past_key_values separately for better memory management
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=return_dict,
+            mesh=mesh,
+        )
+    
+    # First token generation compile step
+    @partial(jax.jit, static_argnums=(5,))
+    def forward_with_past(params, ids, mask, pos_ids, past_kv, return_dict):
+        """
+        Memory-optimized forward step function with past key values.
+        """
+        # Use past_key_values for tokens after the first one
+        return model.apply(
+            params,
+            input_ids=ids,
+            attention_mask=mask,
+            position_ids=pos_ids,  # Pass in the position IDs explicitly
             past_key_values=past_kv,
             output_attentions=False,
             output_hidden_states=False,
@@ -202,6 +263,13 @@ def generate_text(
     # Start generation timer
     generation_start_time = time.time()
     
+    # Handle generation with batched input
+    batch_size = input_ids.shape[0]
+    
+    # Track EOS tokens
+    eos_token_id = tokenizer.eos_token_id
+    all_terminated = np.zeros(batch_size, dtype=bool)
+    
     # Generation loop
     for i in range(max_decode_tokens):
         # Time the token generation
@@ -210,26 +278,73 @@ def generate_text(
         # Run one step of inference
         is_first_token = state["past_key_values"] is None
         current_input_ids = state["input_ids"] if is_first_token else state["input_ids"][:, -1:]
-        current_position_ids = state["position_ids"] if is_first_token else state["position_ids"][:, -1:]
         
-        # Forward pass through model
+        # Create appropriate position IDs based on current sequence length
+        if is_first_token:
+            # For the first token, use the original position_ids (has same length as input_ids)
+            current_position_ids = state["position_ids"]
+            # CRITICAL FIX: Ensure position_ids match input_ids shape for first token
+            if current_position_ids.shape[1] != current_input_ids.shape[1]:
+                logger.warning(f"Shape mismatch before first forward pass: position_ids {current_position_ids.shape} vs input_ids {current_input_ids.shape}")
+                # Create position_ids with same shape as input_ids
+                current_position_ids = np.arange(current_input_ids.shape[1], dtype=np.int32)[None, :]
+                current_position_ids = np.broadcast_to(current_position_ids, current_input_ids.shape)
+                # Update state
+                state["position_ids"] = current_position_ids
+            
+            if debug:
+                logger.info(f"First token: input_ids shape: {current_input_ids.shape}, position_ids shape: {current_position_ids.shape}")
+        else:
+            # For subsequent tokens, create position IDs for just the new token position
+            seq_length = state["input_ids"].shape[1] - 1  # This is the position of the current token (0-indexed)
+            # FIXED: Create position_ids with the EXACT SAME SHAPE as input_ids to avoid broadcasting issues
+            current_position_ids = np.full_like(current_input_ids, seq_length, dtype=np.int32)
+            if debug and i % 10 == 0:
+                logger.info(f"Token {i}: input_ids shape: {current_input_ids.shape}, position_ids shape: {current_position_ids.shape}, pos_value: {seq_length}")
+        
         try:
-            outputs = forward_step(
-                current_input_ids,
-                state["attention_mask"],
-                current_position_ids,
-                state["past_key_values"],
-                True  # return_dict
-            )
+            # Try to run the model
+            if is_first_token:
+                # Initial pass without past_key_values
+                # Force JIT compilation here by explicitly calling jax.jit
+                if debug:
+                    logger.info(f"First token forward pass with shapes: input_ids={current_input_ids.shape}, "
+                               f"attention_mask={state['attention_mask'].shape}, position_ids={current_position_ids.shape}")
+                outputs = forward_step(
+                    params,
+                    current_input_ids,
+                    state["attention_mask"],
+                    current_position_ids,
+                    True  # return_dict
+                )
+            else:
+                # Subsequent passes with past_key_values
+                # This is faster as it reuses past key/values
+                if debug and i % 10 == 0:
+                    logger.info(f"Token {i} forward pass with shapes: input_ids={current_input_ids.shape}, "
+                               f"attention_mask={state['attention_mask'].shape}, position_ids={current_position_ids.shape}, "
+                               f"past_kv_len={len(state['past_key_values'])}")
+                outputs = forward_with_past(
+                    params,
+                    current_input_ids,
+                    state["attention_mask"],
+                    current_position_ids,
+                    state["past_key_values"],
+                    True  # return_dict
+                )
+                
+            # Clear JAX backend caches periodically to prevent memory growth
+            if i % 10 == 0 and i > 0:
+                jax.clear_caches()
+                gc.collect()
+                
         except Exception as e:
-            logger.error(f"Error during forward pass: {e}")
+            logger.error(f"Error during forward pass at token {i}: {e}")
             import traceback
             traceback.print_exc()
-            logger.error(f"Current ids shape: {current_input_ids.shape}")
-            logger.error(f"Current position_ids shape: {current_position_ids.shape}")
-            logger.error(f"Attention mask shape: {state['attention_mask'].shape}")
-            if state["past_key_values"] is not None:
-                logger.error(f"Past KV is not None, count: {len(state['past_key_values'])}")
+            logger.error(f"Current input_ids shape: {current_input_ids.shape}")
+            if not is_first_token:
+                logger.error(f"Past key/values exist with length: {len(state['past_key_values'])}")
             raise
         
         # Get logits and update past key values
@@ -243,6 +358,10 @@ def generate_text(
             
         # Get next token logits (last token only)
         next_token_logits = logits[:, -1:, :]
+        
+        # Memory usage after forward pass
+        if debug and i % 10 == 0:
+            forward_mem = log_memory_usage(f"after forward pass for token {i}")
             
         # Update PRNG key
         rng_key, sampling_key = jax.random.split(rng_key)
@@ -259,43 +378,69 @@ def generate_text(
         # Convert to numpy for easier manipulation
         next_token_np = np.array(next_token)
         
-        # Update generation state
-        state["input_ids"] = np.concatenate([state["input_ids"], next_token_np[:, None]], axis=1)
-        state["attention_mask"] = np.concatenate([state["attention_mask"], np.ones_like(next_token_np[:, None])], axis=1)
-        state["position_ids"] = np.concatenate([state["position_ids"], state["position_ids"][:, -1:] + 1], axis=1)
+        # Check for EOS token and update terminated flag
+        for b in range(batch_size):
+            if next_token_np[b, 0] == eos_token_id:
+                all_terminated[b] = True
+        
+        # Check if all sequences are terminated
+        if np.all(all_terminated):
+            logger.info(f"All sequences terminated at step {i}")
+            break
+        
+        # Measure token generation time
+        token_time = time.time() - token_start_time
+        if i % 10 == 0:  # Log every 10 tokens
+            logger.info(f"Generated token {i} in {token_time:.4f}s")
+        
+        # Append to the input_ids
+        state["input_ids"] = np.concatenate([state["input_ids"], next_token_np], axis=1)
+        
+        # Update attention mask for the new token
+        # The attention mask should be 2D and the same shape as input_ids
+        if len(state["attention_mask"].shape) == 2:
+            state["attention_mask"] = np.pad(
+                state["attention_mask"],
+                ((0, 0), (0, 1)),
+                mode="constant",
+                constant_values=1
+            )
+        else:
+            # If 4D mask with shape [batch, 1, 1, seq_len], update it correctly
+            seq_len = state["input_ids"].shape[1]
+            state["attention_mask"] = np.ones((batch_size, 1, 1, seq_len), dtype=np.int32)
+        
+        # Update past key values for next iteration
         state["past_key_values"] = past_key_values
         
-        # Calculate token generation speed
-        token_time = time.time() - token_start_time
-        
-        # Decode the new token and update generated text
-        new_text = tokenizer.decode(state["input_ids"][0, input_ids.shape[1]:], skip_special_tokens=True)
-        
-        # Only process what's new since last token
-        if new_text != past_text:
-            added_text = new_text[len(past_text):]
-            generated_text += added_text
-            past_text = new_text
+        # Decode for streaming output
+        if streamer is not None:
+            # Decode only the newly generated token
+            new_text = tokenizer.decode(next_token_np[0])
             
-            # Call stream handler if provided
-            if streamer:
-                streamer(added_text)
+            # Stream the new text
+            if new_text:
+                generated_text += new_text
+                streamer(new_text)
                 
-            # Log token generation (only when there's actual new text)
-            logger.debug(f"Generated token {i+1}/{max_decode_tokens} in {token_time:.4f}s ({1/token_time:.2f} tokens/sec)")
+    # Final generated text
+    if streamer is None:
+        # Decode the entire sequence if not streaming
+        generated_text = tokenizer.decode(state["input_ids"][0])
         
-        # Check for EOS token
-        if next_token_np[0] == tokenizer.eos_token_id:
-            logger.info(f"Reached EOS token after generating {i+1} tokens")
-            break
+    # Calculate overall generation time
+    generation_time = time.time() - generation_start_time
+    tokens_generated = state["input_ids"].shape[1] - input_ids.shape[1]
+    logger.info(f"Generated {tokens_generated} tokens in {generation_time:.2f}s "
+                f"({tokens_generated / generation_time:.2f} tokens/sec)")
     
-    # Log generation statistics
-    total_time = time.time() - generation_start_time
-    total_new_tokens = len(state["input_ids"][0]) - len(input_ids[0])
-    logger.info(f"Generated {total_new_tokens} tokens in {total_time:.2f}s ({total_new_tokens/total_time:.2f} tokens/sec)")
+    # Log final memory usage
+    if debug:
+        end_mem = log_memory_usage("end of generation")
+        logger.info(f"Memory change during generation: {end_mem - generation_start_mem:.2f} GB")
     
-    # Return the complete generated text (prompt + generation)
-    return prompt_tokens + generated_text
+    # Return the generated text
+    return generated_text
 
 
 def stream_process_outputs(model, tokenizer, prompt, stream_handler=None, **generation_kwargs):
