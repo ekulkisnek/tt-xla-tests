@@ -1,143 +1,89 @@
-# Qwen2.5-7B Tensor Parallel Implementation in JAX/Flax
+# Qwen25 JAX Model with Tensor Parallelism
 
-This directory contains a tensor parallel implementation of the Qwen2.5-7B model using JAX and Flax. The implementation supports various mesh shapes for tensor parallelism, making it suitable for running on multiple devices efficiently.
+This directory contains a JAX implementation of the Qwen25 model with tensor parallelism support, enabling efficient inference on multi-GPU/TPU systems.
 
 ## Features
 
-- Tensor parallelism (not data parallelism) following the JAX GSPMD approach
-- Memory-efficient weight loading from HuggingFace safetensors files
-- Support for Grouped Query Attention (GQA) with proper tensor sharding
-- Support for various mesh shapes (1x8, 2x4, 1x32, 8x4)
-- Text generation with customizable parameters
-- BFloat16/Float16/Float32 precision support
+- JAX-based implementation for XLA compilation
+- Tensor parallelism support for multi-device inference
+- Memory-efficient attention mechanism
+- Streaming text generation
+- Support for standard sampling techniques (temperature, top-k, top-p)
 
-## Requirements
+## Getting Started
 
-- JAX
-- Flax
-- Safetensors
-- Transformers (for tokenizer)
+### Prerequisites
 
-Install dependencies with:
+- JAX and Flax
+- Transformers library (for tokenizer)
+- Safetensors (for loading model weights)
+
+### Installation
+
+Make sure you have the required dependencies:
 
 ```bash
-pip install jax jaxlib flax transformers safetensors numpy
+pip install jax jaxlib flax transformers safetensors
 ```
 
-## Model Architecture
+For GPU support, install the appropriate JAX version:
 
-The Qwen2.5-7B model is a decoder-only transformer with the following architecture:
+```bash
+pip install --upgrade "jax[cuda]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+```
 
-- 28 transformer layers
-- 3584 hidden dimensions
-- 28 attention heads
-- 4 key/value heads (Grouped Query Attention)
-- SwiGLU activation function
-- RMSNorm for normalization
-- Rotary positional embeddings
+### Downloading Qwen25 Model Weights
 
-## Implementation Details
+The Qwen25 weights are already available locally at `qwen25-weights` directory.
 
-The implementation focuses on tensor parallelism, sharding key model parameters across devices:
+If you need to download fresh weights:
 
-- Attention query, key, value projections are sharded across the heads dimension
-- MLP intermediate projections are sharded across the intermediate dimension
-- Embedding and LM head are sharded appropriately
-
-The parameter loading pipeline includes:
-
-1. Loading weights incrementally from safetensors files to reduce memory usage
-2. Mapping PyTorch parameter names to Flax parameter structure
-3. Handling dimension mismatches and transpositions
-4. Special handling for GQA to ensure proper head distribution
+```bash
+git lfs install
+git clone https://huggingface.co/Qwen/Qwen2.5-7B
+```
 
 ## Usage
 
-### Running the Model
+### Running Inference
+
+There are two ways to run inference with the Qwen25 model:
+
+#### 1. Memory-Efficient Inference
+
+This script focuses on memory optimization and runs a simple forward pass with the model:
 
 ```bash
-python qwen25_tp_model.py --weights_dir /path/to/qwen25-weights --mesh_shape 1,8 --prompt "Once upon a time"
+# Basic usage - run the memory-efficient version
+python run_memory_efficient.py --weights_dir qwen25-weights --dtype bfloat16
+
+# With additional options
+python run_memory_efficient.py --weights_dir qwen25-weights --dtype bfloat16 --generate --profile
 ```
 
-### Arguments
+#### 2. Text Generation
 
-- `--weights_dir`: Path to the directory containing Qwen2.5 weights
-- `--mesh_shape`: Device mesh shape for tensor parallelism (e.g., "1,8", "2,4")
-- `--prompt`: Text prompt for generation
-- `--max_length`: Maximum number of tokens to generate
-- `--dtype`: Data type (float32, float16, bfloat16)
-- `--temperature`: Sampling temperature
-- `--top_p`: Nucleus sampling probability
-- `--deterministic`: Use deterministic decoding (no sampling)
-- `--test`: Run a basic test without generation
+For interactive text generation with custom prompts:
 
-### Code Example
+```bash
+# Generate text from a prompt
+python run_inference.py --model_path qwen25-weights \
+    --prompt "Write a short story about a robot learning to paint:" \
+    --max_tokens 200
 
-```python
-from tt_xla.tests.jax.models.qwen25.qwen25_tp_model import (
-    TPQwenForCausalLM, 
-    load_qwen_model, 
-    create_mesh_from_string,
-    generate_text
-)
-from transformers import AutoTokenizer
-
-# Create a device mesh
-mesh_shape = "1,8"
-mesh = create_mesh_from_string(mesh_shape)
-
-# Load model and tokenizer
-with mesh:
-    model, params = load_qwen_model(
-        weights_dir="/path/to/qwen25-weights",
-        mesh_shape=mesh_shape,
-        dtype=jnp.bfloat16,
-    )
-tokenizer = AutoTokenizer.from_pretrained("/path/to/qwen25-weights")
-
-# Generate text
-prompt = "Artificial intelligence is"
-with mesh:
-    output = generate_text(
-        model=model,
-        tokenizer=tokenizer,
-        params=params,
-        prompt=prompt,
-        max_length=100,
-    )
-print(output)
+# With custom generation parameters
+python run_inference.py --model_path qwen25-weights \
+    --prompt "Explain how quantum computing works:" \
+    --max_tokens 300 \
+    --temperature 0.8 \
+    --top_p 0.92 \
+    --top_k 40 \
+    --dtype bfloat16
 ```
 
-## Tensor Parallel Design
+### Advanced Options
 
-This implementation uses JAX's GSPMD for tensor parallelism:
-
-1. **Sharding Specifications**: Uses `PartitionSpec` to annotate how tensors should be partitioned.
-2. **Explicit Constraints**: Uses `with_sharding_constraint` to enforce sharding decisions.
-3. **Parameter Placement**: Explicitly places parameters on the right devices during loading.
-4. **Mesh Context**: All operations are performed within the mesh context.
-
-### Attention Sharding
-
-The attention mechanism is sharded as follows:
-
-- Query heads are sharded across model dimension (more heads)
-- Key/Value heads are sharded efficiently for GQA (fewer heads)
-- Rotary embeddings are applied with sharding awareness
-
-### MLP Sharding
-
-The MLP (SwiGLU) is sharded as follows:
-
-- Gate and up projections are sharded on the output dimension
-- Down projection is sharded on the input dimension
-
-## Performance Considerations
-
-- Using bfloat16 precision is recommended for optimal performance
-- Memory usage scales with model size and sequence length
-- Generation speed depends on the hardware and mesh configuration
-
-## License
-
-This implementation follows the license of the original Qwen2.5 model. 
+- `--dtype`: Choose between float32, float16, or bfloat16 (default is bfloat16)
+- `--mesh_shape`: Configure device mesh for tensor parallelism (e.g., '1,8')
+- `--debug`: Enable detailed debug logging
+- `--no_stream`: Disable streaming output during generation

@@ -30,8 +30,8 @@ except ImportError:
     logging.error("safetensors package is required. Install with: pip install safetensors")
     sys.exit(1)
 
-# Import optimized model 
-from tt_xla.jax.models.qwen25.model import create_qwen25_model, stream_load_qwen25_model
+# Import optimized model - using local imports instead of tt_xla package
+from model import create_qwen25_model
 
 # Configure logging
 logging.basicConfig(
