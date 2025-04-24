@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Run inference with the Qwen25 JAX model.
+Run inference with the Qwen25 JAX model. j
 """
 
 import os
